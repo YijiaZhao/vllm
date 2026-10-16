@@ -236,6 +236,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     attn_metadata.block_table[:num_decodes],
                     block_size,
                     is_valid,
+                    cp_layout=self.cp_layout,
                 )
                 topk_indices = self.topk_indices_buffer[:num_decode_tokens]
                 topk_indices.fill_(-1)

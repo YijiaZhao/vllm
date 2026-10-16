@@ -25,6 +25,7 @@ from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.worker.cp_utils import (
     DEFAULT_CP_LAYOUT,
     ContextParallelLayout,
+    cp_global_to_local_block,
     cp_global_to_local_pos,
     cp_is_local_pos,
 )
@@ -486,8 +487,13 @@ def compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor,
+    cp_layout: ContextParallelLayout = DEFAULT_CP_LAYOUT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local topk indices to global KV cache slots and count valid entries.
+
+    With DCP, ``topk_indices`` hold global compressed-entry ids (output of the
+    DCP indexer merge). Only entries owned by this rank are kept, mapped to
+    rank-local slots and compacted to the front; the tail is -1.
 
     Fuses three operations into a single kernel:
     1. Block-table lookup (local index → global slot id)
@@ -495,7 +501,10 @@ def compute_global_topk_indices_and_lens(
     3. Masking padding tokens to length 0
     """
     num_tokens = topk_indices.shape[0]
-    global_topk_indices = torch.empty_like(topk_indices)
+    if cp_layout.enabled:
+        global_topk_indices = torch.full_like(topk_indices, -1)
+    else:
+        global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
@@ -510,6 +519,7 @@ def compute_global_topk_indices_and_lens(
         block_size,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
+        **cp_layout.triton_kwargs(),
     )
     return global_topk_indices, topk_lens
 
@@ -528,6 +538,9 @@ def _compute_global_topk_indices_and_lens_kernel(
     block_size,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr = 1,
 ):
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
@@ -545,20 +558,41 @@ def _compute_global_topk_indices_and_lens_kernel(
         )
         is_valid = local_idx >= 0
 
-        block_indices = local_idx // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask & is_valid,
-        )
-        block_offsets = local_idx % block_size
+        if DCP_WORLD_SIZE > 1:
+            block_indices, block_offsets, is_local = cp_global_to_local_block(
+                tl.maximum(local_idx, 0),
+                block_size,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            is_valid = is_valid & is_local & mask
+            block_numbers = tl.load(
+                block_table_ptr + req_idx * block_table_stride + block_indices,
+                mask=is_valid,
+            )
+            slot_ids = block_numbers * block_size + block_offsets
+            dst = count + tl.cumsum(is_valid.to(tl.int32), 0) - 1
+            tl.store(
+                global_topk_indices_ptr + token_idx * global_topk_indices_stride + dst,
+                slot_ids,
+                mask=is_valid,
+            )
+        else:
+            block_indices = local_idx // block_size
+            block_numbers = tl.load(
+                block_table_ptr + req_idx * block_table_stride + block_indices,
+                mask=mask & is_valid,
+            )
+            block_offsets = local_idx % block_size
 
-        slot_ids = block_numbers * block_size + block_offsets
-        slot_ids = tl.where(is_valid, slot_ids, -1)
-        tl.store(
-            global_topk_indices_ptr + token_idx * global_topk_indices_stride + offset,
-            slot_ids,
-            mask=mask,
-        )
+            slot_ids = block_numbers * block_size + block_offsets
+            slot_ids = tl.where(is_valid, slot_ids, -1)
+            tl.store(
+                global_topk_indices_ptr + token_idx * global_topk_indices_stride + offset,
+                slot_ids,
+                mask=mask,
+            )
         count += tl.sum(is_valid.to(tl.int32), axis=0)
 
     # Zero out length for padding tokens.
