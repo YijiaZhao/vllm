@@ -84,3 +84,26 @@ def dcp_softmax_reduce(
         global_weighted_value / global_sum,
         torch.zeros_like(global_weighted_value),
     )
+
+
+def dcp_softmax_reduce_packed(
+    local_max: torch.Tensor,
+    local_sum: torch.Tensor,
+    local_weighted_value: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Same result as ``dcp_softmax_reduce`` with a single all_gather.
+
+    Ranks with no local entries carry (max=-inf, sum=0, value=0).
+    """
+    packed = torch.stack((local_max, local_sum, local_weighted_value))
+    gathered = group.all_gather(packed.unsqueeze(0), dim=0)  # [W, 3, N, D]
+    m, s, v = gathered.unbind(1)
+    global_max = m.max(dim=0).values
+    scale = torch.exp(m - global_max.clamp_min(-3.0e38))
+    scale = torch.where(s > 0, scale, torch.zeros_like(scale))
+    global_sum = (s * scale).sum(dim=0)
+    global_value = (v * scale).sum(dim=0)
+    return torch.where(
+        global_sum > 0, global_value / global_sum, torch.zeros_like(global_value)
+    )
