@@ -90,8 +90,6 @@ def validate_dsv4_cp_config(vllm_config: VllmConfig) -> None:
     unsupported = []
     if vllm_config.speculative_config is not None:
         unsupported.append("speculative decoding")
-    if vllm_config.cache_config.enable_prefix_caching:
-        unsupported.append("prefix caching")
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is not None:
         # P/D: NixlPushConnector moves whole 256-token pages between DCP
