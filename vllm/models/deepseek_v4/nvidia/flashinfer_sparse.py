@@ -3,6 +3,7 @@
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
 import math
+import os
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -52,7 +53,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+# The SM120 decode plan's split buffers grow with batch x compressed width, and SM120
+# decodes the C128 segment at full max_model_len / 128 width: long max_model_len
+# (e.g. 1M) needs more than the 128 MiB default under CUDA graph capture.
+_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = (
+    int(os.environ.get("VLLM_DSV4_FLASHINFER_WORKSPACE_MB", "128")) * 1024 * 1024
+)
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
