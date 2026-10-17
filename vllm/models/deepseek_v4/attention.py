@@ -48,7 +48,7 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4.common.cp import cp_debug, validate_dsv4_cp_config
+from vllm.models.deepseek_v4.common.cp import validate_dsv4_cp_config
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -643,7 +643,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             q = project_query_and_cache_kv()
 
-        cp_debug(f"{self.prefix} prepared", q, kv)
         self._sparse_indexer_and_attn(
             hidden_states,
             index_q,
@@ -763,11 +762,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 index_weights,
             )
 
-        cp_debug(f"{self.prefix} indexer done", index_q)
         # MLA attention writes into the pre-allocated `out` buffer
         # (see _alloc_attn_out).
         self.forward_mqa(q, kv, positions, out)
-        cp_debug(f"{self.prefix} mqa done", q)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -823,7 +820,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     False,
                 )
                 slot_mapping = slot_mapping[:0]
-                cp_debug(f"{self.prefix} swa gathered insert", kv)
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:

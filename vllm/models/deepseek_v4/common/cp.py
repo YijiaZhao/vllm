@@ -396,21 +396,3 @@ def dcp_local_topk_indices_and_lens(
         BLOCK=1024,
     )
     return out, lens
-
-
-_CP_DEBUG = int(__import__("os").environ.get("DSV4_CP_DEBUG", "0"))
-_cp_debug_count = 0
-
-
-def cp_debug(tag: str, *tensors: torch.Tensor | None) -> None:
-    """DSV4_CP_DEBUG=N: synchronize and log the first N CP checkpoints."""
-    global _cp_debug_count
-    if not _CP_DEBUG or _cp_debug_count >= _CP_DEBUG:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    _cp_debug_count += 1
-    torch.cuda.synchronize()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    shapes = [None if t is None else tuple(t.shape) for t in tensors]
-    print(f"[cp_debug r{rank} #{_cp_debug_count}] {tag} {shapes}", flush=True)

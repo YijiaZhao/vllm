@@ -14,7 +14,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.cp import (
-    cp_debug,
     gather_token_rows,
     padded_token_to_req,
     replicated_slot_mapping,
@@ -450,7 +449,6 @@ class DeepseekCompressor(nn.Module):
                     [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
                 )
             assert kv.shape[0] == state_metadata.slot_mapping.shape[0]
-            cp_debug(f"{self.prefix} compressor in", kv, positions)
         token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping
         num_actual = slot_mapping.shape[0]

@@ -11,7 +11,6 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.cp import (
     DCPPrefillGatherPlan,
-    cp_debug,
     dcp_local_topk_indices_and_lens,
     dcp_merge_decode,
     gather_token_rows,
@@ -137,14 +136,6 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekSparseSWAMetadataBuilder)
         metadata.dcp_zero_decode_swa_lens = self.dcp_zero_swa_lens[
             : metadata.num_decode_tokens
         ]
-        cp_debug(
-            f"swa build prefills={metadata.num_prefills} "
-            f"decodes={metadata.num_decodes}",
-            local_slots,
-            metadata.cache_slot_mapping,
-            metadata.cache_positions,
-            metadata.cache_token_to_req,
-        )
         return metadata
 
 
@@ -468,7 +459,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             dcp_gathered = self._dcp_gather_prefill_kv(
                 compressed_k_cache, attn_metadata, attn_metadata.dcp_prefill_plan
             )
-            cp_debug(f"{self.prefix} dcp prefill gathered", dcp_gathered)
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size + self.max_image_tokens, 128)
