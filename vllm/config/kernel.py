@@ -438,6 +438,51 @@ class KernelConfig:
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 
+    def _select_dsv4_cp_mega_moe(self, vllm_config: "VllmConfig") -> None:
+        """DeepSeek-V4 context parallelism runs its MoE as a MegaMoE.
+
+        With "auto", pick the FlashInfer MoE-EP megakernel of the platform
+        (DeepGEMM on SM10x, Cake on SM12x). SM12x requires it.
+        """
+        from vllm.platforms import current_platform
+
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        if (
+            model_config is None
+            or getattr(model_config.hf_config, "model_type", None) != "deepseek_v4"
+            or (
+                parallel_config.prefill_context_parallel_size == 1
+                and parallel_config.decode_context_parallel_size == 1
+            )
+        ):
+            return
+        capability = current_platform.get_device_capability()
+        if capability is None or capability.major not in (10, 12):
+            return
+        mega_backend = (
+            FLASHINFER_MOE_EP_CAKE
+            if capability.major == 12
+            else FLASHINFER_MOE_EP_DEEP_GEMM
+        )
+        if self.moe_backend == "auto":
+            if not parallel_config.enable_expert_parallel:
+                if capability.major == 12:
+                    raise ValueError(
+                        "DeepSeek-V4 context parallelism on SM12x runs the MoE as "
+                        f"{mega_backend!r}, which requires --enable-expert-parallel."
+                    )
+                return
+            logger.info(
+                "DeepSeek-V4 context parallelism: using moe_backend=%r.", mega_backend
+            )
+            self.moe_backend = mega_backend
+        elif capability.major == 12 and self.moe_backend != mega_backend:
+            raise ValueError(
+                "DeepSeek-V4 context parallelism on SM12x requires "
+                f"moe_backend={mega_backend!r}; got {self.moe_backend!r}."
+            )
+
     @field_validator(
         "enable_flashinfer_autotune",
         "enable_cutedsl_warmup",
@@ -455,6 +500,7 @@ class KernelConfig:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
 
+        self._select_dsv4_cp_mega_moe(vllm_config)
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(
                 self.moe_backend, vllm_config.model_config.architectures
