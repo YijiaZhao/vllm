@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import contextlib
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, fields
@@ -459,6 +460,10 @@ class KernelConfig:
             return
         capability = current_platform.get_device_capability()
         if capability is None or capability.major not in (10, 12):
+            return
+        if os.environ.get("VLLM_DSV4_CP_NO_MEGA_MOE", "0") == "1":
+            # Escape hatch: keep the regular (non-MegaMoE) EP MoE path under CP.
+            logger.info("DeepSeek-V4 context parallelism: MegaMoE disabled by env.")
             return
         mega_backend = (
             FLASHINFER_MOE_EP_CAKE
