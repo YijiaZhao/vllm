@@ -5,8 +5,19 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.cp import (
+    DCPPrefillGatherPlan,
+    cp_debug,
+    dcp_local_topk_indices_and_lens,
+    dcp_merge_decode,
+    gather_token_rows,
+    padded_token_to_req,
+    replicated_slot_mapping,
+)
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -21,7 +32,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
 )
 from vllm.utils.math_utils import round_up
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
     DeepseekSparseSWAMetadataBuilder,
@@ -36,13 +47,112 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+def _flashmla_lse_2d(lse: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """FlashMLA decode LSE ([T, H, 1] or [T, 1, H]) as [T, H]."""
+    if lse.ndim == 3 and lse.shape[-1] == 1:
+        return lse.squeeze(-1)
+    if lse.ndim == 3 and lse.shape[1] == 1:
+        return lse.squeeze(1)
+    return lse.reshape(num_tokens, -1)
+
+
 class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        parallel_config = self.vllm_config.parallel_config
+        self.use_cp = parallel_config.prefill_context_parallel_size > 1
+        if not self.use_cp:
+            return
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        # A split prefill gives every PCP rank two rows.
+        self.no_replay_start = self.no_replay_start.new_zeros(2 * max_num_seqs + 1)
+        self.local_slot_buffer = torch.empty(
+            self._max_tokens, dtype=torch.int64, device=self.device
+        )
+        self.cp_token_to_req = torch.zeros(
+            self._max_tokens, dtype=torch.int32, device=self.device
+        )
+        self.req_lookup = torch.zeros(
+            2 * max_num_seqs + 1, dtype=torch.int32, device=self.device
+        )
+        self.dcp_zero_swa_lens = torch.zeros(
+            self._max_tokens, dtype=torch.int32, device=self.device
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ) -> "DeepseekSparseSWAMetadata":
+        if not self.use_cp:
+            return super().build(
+                common_prefix_len, common_attn_metadata, fast_build, replay_start
+            )
+        cm = common_attn_metadata
+        assert cm.positions is not None
+        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        # The runner's slot mapping is the PCP-gathered layout; queries need
+        # their own tokens' slots in this replicated cache.
+        num_local = cm.slot_mapping.shape[0] // pcp_size
+        positions = cm.positions[:num_local]
+        token_to_req = padded_token_to_req(cm, self.cp_token_to_req, num_local)
+        local_slots = replicated_slot_mapping(
+            self.local_slot_buffer,
+            positions,
+            token_to_req,
+            cm.block_table_tensor,
+            self.block_size,
+            cm.num_actual_tokens,
+        )
+        metadata = super().build(
+            common_prefix_len,
+            cm.replace(slot_mapping=local_slots),
+            fast_build,
+            replay_start,
+        )
+        # Decode rows are replicated, so a step without prefill rows has every
+        # token on every rank; one with prefill rows gathers them.
+        metadata.cache_gathered = metadata.num_prefills > 0
+        if metadata.cache_gathered:
+            metadata.cache_slot_mapping = cm.slot_mapping
+            metadata.cache_positions = get_pcp_group().all_gather(positions, dim=0)
+            metadata.cache_token_to_req = gather_token_rows(
+                token_to_req,
+                num_local,
+                cm.num_actual_tokens,
+                cm.req_idx,
+                cm.num_reqs,
+                self.req_lookup,
+            )
+        else:
+            metadata.cache_slot_mapping = local_slots
+            metadata.cache_positions = positions
+            metadata.cache_token_to_req = token_to_req
+        metadata.dcp_zero_decode_swa_lens = self.dcp_zero_swa_lens[
+            : metadata.num_decode_tokens
+        ]
+        cp_debug(
+            f"swa build prefills={metadata.num_prefills} "
+            f"decodes={metadata.num_decodes}",
+            local_slots,
+            metadata.cache_slot_mapping,
+            metadata.cache_positions,
+            metadata.cache_token_to_req,
+        )
+        return metadata
+
 
 class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashMLAMetadataBuilder]:
         return DeepseekSparseSWAFlashMLAMetadataBuilder
@@ -57,6 +167,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+        parallel_config = get_current_vllm_config().parallel_config
+        self.dcp_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.cp_interleave = parallel_config.cp_kv_cache_interleave_size
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
@@ -185,12 +299,32 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         topk_indices = None
         topk_lens = None
+        # DCP: the compressed KV is sharded, so each rank attends over its own
+        # entries (plus, on rank 0, the replicated window) and the partial
+        # results are merged by LSE.
+        use_dcp = self.dcp_size > 1 and not swa_only
         if not swa_only:
             assert attn_metadata is not None
             assert swa_metadata.is_valid_token is not None
             block_size = attn_metadata.block_size // self.compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
+            if self.compress_ratio == 4 and use_dcp:
+                assert self.topk_indices_buffer is not None
+                topk = self.topk_indices_buffer[:num_decode_tokens]
+                local_indices, topk_lens = dcp_local_topk_indices_and_lens(
+                    topk,
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    is_valid,
+                    self.cp_interleave // self.compress_ratio,
+                    out=torch.empty_like(topk),
+                    lens=torch.empty(
+                        num_decode_tokens, dtype=torch.int32, device=topk.device
+                    ),
+                )
+                topk_indices = local_indices.view(num_decode_tokens, 1, -1)
+            elif self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
@@ -208,6 +342,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+        if use_dcp and self.dcp_rank != 0:
+            assert swa_metadata.dcp_zero_decode_swa_lens is not None
+            swa_lens = swa_metadata.dcp_zero_decode_swa_lens
 
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
@@ -245,7 +382,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             "allocate one for this layer type."
         )
 
-        out, _ = flash_mla_with_kvcache(
+        out, lse = flash_mla_with_kvcache(
             q=q,
             k_cache=swa_cache,
             block_table=None,
@@ -256,12 +393,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             indices=swa_indices,
             topk_length=swa_lens,
             softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
+            # The sink joins the softmax once, after the DCP merge.
+            attn_sink=None if use_dcp else self.attn_sink,
             extra_k_cache=kv_cache if not swa_only else None,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
-            out=output.unsqueeze(1),
+            out=torch.empty_like(q) if use_dcp else output.unsqueeze(1),
         )
+        if use_dcp:
+            assert topk_lens is not None
+            heads = self.n_local_heads
+            out = out.view(num_decode_tokens, -1, out.shape[-1])[:, :heads]
+            lse = _flashmla_lse_2d(lse, num_decode_tokens)[:, :heads]
+            # Rows without a single local entry have undefined out/lse;
+            # (0, -inf) drops this rank from their merge.
+            empty = (swa_lens + topk_lens) == 0
+            out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
+            lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
+            output[:, :heads].copy_(dcp_merge_decode(out, lse, self.attn_sink))
 
     def _forward_prefill(
         self,
@@ -311,6 +460,15 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             compress_ratio=self.compress_ratio,
             prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
         )
+        # DCP: every prefill request's compressed KV, gathered from all ranks.
+        dcp_gathered = None
+        if self.dcp_size > 1 and not swa_only:
+            assert attn_metadata is not None
+            assert attn_metadata.dcp_prefill_plan is not None
+            dcp_gathered = self._dcp_gather_prefill_kv(
+                compressed_k_cache, attn_metadata, attn_metadata.dcp_prefill_plan
+            )
+            cp_debug(f"{self.prefix} dcp prefill gathered", dcp_gathered)
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size + self.max_image_tokens, 128)
@@ -322,7 +480,16 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 ((self.max_num_batched_tokens,), torch.int32),
             )
             kv, combined_indices_out, combined_lens_out = workspace
-            if not swa_only:
+            if dcp_gathered is not None:
+                assert attn_metadata is not None
+                plan = attn_metadata.dcp_prefill_plan
+                assert plan is not None
+                self._dcp_scatter_prefill_kv(
+                    kv[:chunk_size, :chunk_N],
+                    dcp_gathered,
+                    plan.row_to_req[chunk_start:chunk_end],
+                )
+            elif not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
@@ -396,3 +563,48 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
             )
+
+    def _dcp_gather_prefill_kv(
+        self,
+        compressed_k_cache: torch.Tensor | None,
+        attn_metadata: DeepseekV4FlashMLAMetadata,
+        plan: DCPPrefillGatherPlan,
+    ) -> torch.Tensor:
+        """[dcp, num_prefill_reqs, max_shard_rows, 512] bf16 compressed KV."""
+        assert compressed_k_cache is not None
+        num_reqs = plan.req_rows.shape[0]
+        max_rows = int(plan.shard_rows.max())
+        local = torch.empty(
+            (num_reqs, max_rows, self.head_dim),
+            dtype=torch.bfloat16,
+            device=compressed_k_cache.device,
+        )
+        dequantize_and_gather_k_cache(
+            local,
+            compressed_k_cache,
+            seq_lens=plan.shard_rows.to(local.device, non_blocking=True),
+            gather_lens=None,
+            block_table=attn_metadata.block_table[plan.req_rows.long()],
+            block_size=attn_metadata.block_size // self.compress_ratio,
+            offset=0,
+        )
+        return get_dcp_group().all_gather(local.unsqueeze(0), dim=0)
+
+    def _dcp_scatter_prefill_kv(
+        self,
+        kv: torch.Tensor,
+        gathered: torch.Tensor,
+        row_to_req: torch.Tensor,
+    ) -> None:
+        """Lay each row's request KV out in global compressed order."""
+        num_entries = kv.shape[1]
+        if num_entries == 0:
+            return
+        interleave = self.cp_interleave // self.compress_ratio
+        k = torch.arange(num_entries, device=kv.device)
+        rank = (k // interleave) % self.dcp_size
+        local = k // (interleave * self.dcp_size) * interleave + k % interleave
+        local = local.clamp(max=gathered.shape[2] - 1)
+        kv.copy_(
+            gathered[rank.unsqueeze(0), row_to_req.unsqueeze(1), local.unsqueeze(0)]
+        )

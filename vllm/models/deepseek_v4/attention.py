@@ -40,7 +40,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -48,6 +48,7 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.models.deepseek_v4.common.cp import cp_debug, validate_dsv4_cp_config
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -315,7 +316,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 aux_stream=indexer_aux_stream,
             )
 
+        # Context parallelism (see deepseek_v4/common/cp.py).
+        validate_dsv4_cp_config(vllm_config)
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+
         self._prepare_and_attn_fn = self._prepare_and_attn
+        if self.use_pcp:
+            # The cache writes branch on whether the step has prefill rows (and
+            # then all-gather across PCP), so they must not be replayed from a
+            # piecewise graph. FULL decode graphs only ever see decode steps.
+            self._prepare_and_attn_fn = self._prepare_and_attn_eager
         if not vllm_config.use_v2_model_runner:
             # MRV1's piecewise capture only tolerates the wide eager region: with
             # the narrow one the attention input preparation stays in the captured
@@ -583,7 +593,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
         compressor = self.compressor
-        aux_streams = self.aux_stream_list
+        # Keep PCP collectives on one stream in the same order on every rank.
+        aux_streams = None if self.use_pcp else self.aux_stream_list
 
         def project_query_and_cache_kv() -> torch.Tensor:
             q = self._wq_b_proj(qr, qr_scale).view(
@@ -632,6 +643,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             q = project_query_and_cache_kv()
 
+        cp_debug(f"{self.prefix} prepared", q, kv)
         self._sparse_indexer_and_attn(
             hidden_states,
             index_q,
@@ -751,9 +763,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 index_weights,
             )
 
+        cp_debug(f"{self.prefix} indexer done", index_q)
         # MLA attention writes into the pre-allocated `out` buffer
         # (see _alloc_attn_out).
         self.forward_mqa(q, kv, positions, out)
+        cp_debug(f"{self.prefix} mqa done", q)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -788,6 +802,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
 
+        slot_mapping = swa_metadata.slot_mapping
+        if self.use_pcp:
+            assert cache_dtype == torch.uint8, (
+                "DeepSeek-V4 context parallelism requires the fp8_ds_mla cache."
+            )
+            if swa_metadata.cache_gathered:
+                # Every rank keeps the whole window: insert all PCP ranks'
+                # tokens, then prepare only the local queries below.
+                assert swa_metadata.cache_slot_mapping is not None
+                assert swa_metadata.cache_positions is not None
+                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                    get_pcp_group().all_gather(kv.contiguous(), dim=0),
+                    swa_kv_cache,
+                    swa_metadata.cache_slot_mapping,
+                    swa_metadata.cache_positions,
+                    cos_sin_cache,
+                    swa_metadata.block_size,
+                    None,
+                    False,
+                )
+                slot_mapping = slot_mapping[:0]
+                cp_debug(f"{self.prefix} swa gathered insert", kv)
+
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
@@ -800,7 +837,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q,
                 kv,
                 swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.padded_heads,
@@ -944,6 +981,7 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_config = quant_config
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
@@ -1044,7 +1082,10 @@ class DeepseekV4Indexer(nn.Module):
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
-        self.aux_stream = aux_stream
+        # Under PCP the compressor all-gathers, and collectives must stay on
+        # one stream in the same order on every rank.
+        use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        self.aux_stream = None if use_pcp else aux_stream
         self.ln_events: list[torch.cuda.Event] = [
             torch.cuda.Event(),
             torch.cuda.Event(),
@@ -1084,6 +1125,10 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
                 and not torch.cuda.is_current_stream_capturing()
+                # Under DCP the full path runs collectives, so every rank must
+                # take the same branch; prefill rows give ranks different
+                # max_seq_len, decode rows are replicated.
+                and (self.dcp_size == 1 or indexer_metadata.num_prefills == 0)
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache

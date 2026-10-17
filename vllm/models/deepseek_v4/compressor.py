@@ -8,10 +8,17 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.models.deepseek_v4.common.cp import (
+    cp_debug,
+    gather_token_rows,
+    padded_token_to_req,
+    replicated_slot_mapping,
+)
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
@@ -65,6 +72,10 @@ class CompressorBackend(AttentionBackend):
     def get_name() -> str:
         return "CompressorBackend"
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [MultipleOf(1)]
@@ -87,6 +98,10 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     num_decode_tokens: int | None = None
     c128_boundary: bool | None = None
+    # Context parallelism: the cache tokens' positions, and whether they are the
+    # PCP-gathered tokens (the compressor input is then all-gathered as well).
+    positions: torch.Tensor | None = None
+    cp_gathered: bool = False
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -103,6 +118,17 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        if self.pcp_size > 1:
+            max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+            self.local_slot_buffer = torch.empty(
+                max_tokens, dtype=torch.int64, device=self.device
+            )
+            self.req_lookup = torch.zeros(
+                2 * self.vllm_config.scheduler_config.max_num_seqs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def build(
         self,
@@ -110,6 +136,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
+        if self.pcp_size > 1:
+            return self._build_cp(common_attn_metadata)
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
@@ -133,6 +161,43 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 if self.block_size == 8 and not async_spec_decode
                 else None
             ),
+        )
+
+    def _build_cp(self, cm: CommonAttentionMetadata) -> CompressorMetadata:
+        """Replicated state cache under PCP (see deepseek_v4/common/cp.py)."""
+        assert cm.positions is not None
+        num_local = cm.slot_mapping.shape[0] // self.pcp_size
+        positions = cm.positions[:num_local]
+        token_to_req = padded_token_to_req(cm, self.token_to_req_indices, num_local)
+        block_table = cm.block_table_tensor.clamp_(min=0)
+        _, num_prefills, _, _ = split_decodes_and_prefills(cm, decode_threshold=1)
+        if num_prefills > 0:
+            slot_mapping = cm.slot_mapping
+            token_to_req = gather_token_rows(
+                token_to_req,
+                num_local,
+                cm.num_actual_tokens,
+                cm.req_idx,
+                cm.num_reqs,
+                self.req_lookup,
+            )
+            positions = get_pcp_group().all_gather(positions, dim=0)
+        else:
+            slot_mapping = replicated_slot_mapping(
+                self.local_slot_buffer,
+                positions,
+                token_to_req,
+                block_table,
+                self.block_size,
+                cm.num_actual_tokens,
+            )
+        return CompressorMetadata(
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            block_size=self.block_size,
+            token_to_req_indices=token_to_req,
+            positions=positions,
+            cp_gathered=num_prefills > 0,
         )
 
 
@@ -189,6 +254,8 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            # Under DCP every rank keeps the whole (small) state.
+            dcp_sharded=vllm_config.parallel_config.decode_context_parallel_size == 1,
         )
 
     def forward(self): ...
@@ -374,6 +441,16 @@ class DeepseekCompressor(nn.Module):
         state_metadata = cast(
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
+        if state_metadata.positions is not None:
+            # Context parallelism: the replicated state takes every cache token.
+            positions = state_metadata.positions
+            if state_metadata.cp_gathered:
+                kv_score = get_pcp_group().all_gather(kv_score.contiguous(), dim=0)
+                kv, score = kv_score.split(
+                    [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+                )
+            assert kv.shape[0] == state_metadata.slot_mapping.shape[0]
+            cp_debug(f"{self.prefix} compressor in", kv, positions)
         token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping
         num_actual = slot_mapping.shape[0]

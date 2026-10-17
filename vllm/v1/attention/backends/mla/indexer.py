@@ -1005,6 +1005,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
+        # DeepSeek-V4 PCP + DCP compressed slot buffers (allocated lazily).
+        self._pcp_any_slot: torch.Tensor | None = None
+        self._pcp_slot_out: torch.Tensor | None = None
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # KV compression (DeepseekV4). Default to 1 for no compression.
         self.compress_ratio = 1
@@ -1305,6 +1308,61 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.global_decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = 0
         return self.global_decode_seq_lens_buffer[:num_decode_tokens]
 
+    def _pcp_dcp_compressed_slot_mapping(
+        self, cm: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        """Compressed slots of the cache tokens under PCP + DCP.
+
+        The DeepSeek-V4 compressor writes from this rank's tokens in a
+        decode-only step and from the PCP-gathered tokens otherwise (decode rows
+        are replicated on every rank). The block table is shared by the DCP
+        ranks, so slots are computed owner-agnostically from each rank's own
+        tokens and kept where this rank owns the group's last token.
+        """
+        assert cm.positions is not None
+        num_local = cm.slot_mapping.shape[0] // self.pcp_world_size
+        if self._pcp_any_slot is None:
+            max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+            self._pcp_any_slot = torch.zeros(
+                max_tokens, dtype=torch.int64, device=self.device
+            )
+            self._pcp_slot_out = torch.empty(
+                self.pcp_world_size * max_tokens, dtype=torch.int64, device=self.device
+            )
+        get_compressed_slot_mapping(
+            cm.num_actual_tokens,
+            self._pcp_any_slot[:num_local],
+            cm.query_start_loc,
+            cm.seq_lens,
+            cm.block_table_tensor,
+            self.kv_cache_spec.num_states,
+            self.compress_ratio,
+            out=self.compressed_slot_mapping_buffer,
+            dcp_world_size=self.dcp_world_size,
+            cp_interleave=self.cp_kv_cache_interleave_size,
+        )
+        local = self.compressed_slot_mapping_buffer[:num_local]
+        _, num_prefills, _, _ = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.decode_threshold,
+            require_uniform=not (self.use_flattening or self.supports_varlen),
+            treat_short_extends_as_decodes=False,
+        )
+        if num_prefills == 0:
+            out = self._pcp_slot_out[:num_local]
+            positions = cm.positions[:num_local]
+            owned = (
+                positions // self.cp_kv_cache_interleave_size
+            ) % self.dcp_world_size == self.dcp_rank
+            out.copy_(local).masked_fill_(~owned, -1)
+            return out
+        gathered = get_pcp_group().all_gather(local, dim=0)
+        out = self._pcp_slot_out[: gathered.shape[0]]
+        # The runner's gathered slots are PAD where this rank does not own the
+        # token or the row is a replicated copy written from another rank.
+        out.copy_(gathered).masked_fill_(cm.slot_mapping < 0, -1)
+        return out
+
     def _split_pcp_dcp_prefill_chunks(
         self,
         row_req_idx: np.ndarray,
@@ -1425,7 +1483,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
         compressed_slot_mapping = slot_mapping
-        if self.compress_ratio > 1:
+        if self.compress_ratio > 1 and self.use_pcp and self.dcp_world_size > 1:
+            compressed_slot_mapping = self._pcp_dcp_compressed_slot_mapping(
+                common_attn_metadata
+            )
+        elif self.compress_ratio > 1:
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
             if self.use_pcp:
@@ -1524,6 +1586,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         self.cp_kv_cache_interleave_size,
                     )
                 shard_rows = shard_rows_cpu.numpy()
+                if self.compress_ratio > 1:
+                    # The indexer K is compressed: with the interleave a
+                    # multiple of the ratio, a rank's entries are its whole
+                    # groups, at most its token shard // ratio.
+                    shard_rows = np.maximum(shard_rows // self.compress_ratio, 1)
                 chunk_specs = self._split_pcp_dcp_prefill_chunks(
                     req_idx[num_decodes:],
                     shard_rows[num_decodes:],
@@ -1550,7 +1617,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         shard_rows[req_slice],
                         self.dcp_world_size,
                         self.device,
-                        self.cp_kv_cache_interleave_size,
+                        self.compressed_cp_interleave_size,
                     )
                 metadata = build_prefill_chunk_metadata(
                     req_slice.start,
@@ -1956,7 +2023,12 @@ def build_prefill_chunk_metadata(
         cu_seq_lens=cu_seq_lens,
         token_to_seq=token_to_seq,
         total_seq_lens=total_seq_lens,
-        max_seqlen_k=int(compressed_seq_lens_cpu[start_idx:end_idx].max()),
+        # Under PCP+DCP the plan pads every request to at least one entry per
+        # rank (identical on every rank), even before its first compressed one.
+        max_seqlen_k=max(
+            int(compressed_seq_lens_cpu[start_idx:end_idx].max()),
+            int(pcp_plan is not None),
+        ),
         block_table=block_table[start_idx:end_idx],
         token_start=token_start,
         token_end=token_end,

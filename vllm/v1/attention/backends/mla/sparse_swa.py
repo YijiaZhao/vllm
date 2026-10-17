@@ -144,6 +144,8 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             ),
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
+            # Under DCP the window is replicated on every rank.
+            dcp_sharded=vllm_config.parallel_config.decode_context_parallel_size == 1,
         )
 
     def forward(self): ...
@@ -219,6 +221,13 @@ class DeepseekSparseSWAMetadata:
     # PCP cache writes use the gathered slots; queries use rank-local slots.
     cache_slot_mapping: torch.Tensor | None = None
     cache_positions: torch.Tensor | None = None
+    # DeepseekV4 PCP: the cache tokens' request rows, and whether the cache
+    # tokens are the PCP-gathered ones (else the rank-local tokens).
+    cache_token_to_req: torch.Tensor | None = None
+    cache_gathered: bool = False
+    # DeepseekV4 DCP: zero SWA lengths for decode on DCP ranks other than 0,
+    # which leave the replicated window to rank 0 in compressed layers.
+    dcp_zero_decode_swa_lens: torch.Tensor | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0

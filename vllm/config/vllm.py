@@ -3336,7 +3336,19 @@ class VllmConfig:
             self.kv_transfer_config is not None
             and self.kv_transfer_config.has_connector("NixlConnector")
         )
-        if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
+        # DeepSeek-V4 shards only its compressed MLA and indexer caches (256-token
+        # pages); its smaller replicated caches set the minimum block_size here.
+        # Its interleave is validated by validate_dsv4_cp_config.
+        is_dsv4 = (
+            self.model_config is not None
+            and getattr(self.model_config.hf_config, "model_type", None)
+            == "deepseek_v4"
+        )
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            and not nixl_pd_active
+            and not is_dsv4
+        ):
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0

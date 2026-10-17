@@ -9,11 +9,18 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
     VllmTritonJitKernel,
+)
+from vllm.models.deepseek_v4.common.cp import (
+    PAD_SLOT_ID,
+    DCPPrefillGatherPlan,
+    build_dcp_prefill_gather_plan,
+    owner_mask,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -117,6 +124,8 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
     c128a_prefill_topk_indices: torch.Tensor | None = None
+    # DCP: how to gather the prefill requests' compressed KV from every rank.
+    dcp_prefill_plan: DCPPrefillGatherPlan | None = None
 
 
 class DeepseekV4SparseMLAMetadataBuilder(
@@ -150,6 +159,28 @@ class DeepseekV4SparseMLAMetadataBuilder(
         # stability when compress_ratio > 1.
         if self.compress_ratio > 1:
             self.compressed_slot_mapping_buffer = torch.empty(
+                max_num_batched_tokens, dtype=torch.int64, device=device
+            )
+
+        # Context parallelism (see deepseek_v4/common/cp.py).
+        parallel_config = vllm_config.parallel_config
+        self.pcp_size = parallel_config.prefill_context_parallel_size
+        self.dcp_size = parallel_config.decode_context_parallel_size
+        self.use_cp = self.pcp_size > 1
+        if self.use_cp and self.compress_ratio > 1:
+            self.dcp_rank = get_dcp_group().rank_in_group
+            self.cp_interleave = parallel_config.cp_kv_cache_interleave_size
+            # Zeros: every local token counts as written when computing the
+            # owner-agnostic compressed slots.
+            self.cp_any_slot = torch.zeros(
+                max_num_batched_tokens, dtype=torch.int64, device=device
+            )
+            self.cp_slot_mapping_buffer = torch.empty(
+                self.pcp_size * max_num_batched_tokens,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.cp_valid_token_buffer = torch.empty(
                 max_num_batched_tokens, dtype=torch.int64, device=device
             )
 
@@ -192,7 +223,10 @@ class DeepseekV4SparseMLAMetadataBuilder(
         req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
-        if self.compress_ratio > 1:
+        dcp_prefill_plan = None
+        if self.compress_ratio > 1 and self.use_cp:
+            slot_mapping, dcp_prefill_plan = self._build_cp(cm)
+        elif self.compress_ratio > 1:
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
                 cm.slot_mapping,
@@ -224,7 +258,65 @@ class DeepseekV4SparseMLAMetadataBuilder(
             ),
             c128a_decode_topk_lens=c128a_fields.get("c128a_decode_topk_lens"),
             c128a_prefill_topk_indices=c128a_fields.get("c128a_prefill_topk_indices"),
+            dcp_prefill_plan=dcp_prefill_plan,
         )
+
+    def _build_cp(
+        self, cm: CommonAttentionMetadata
+    ) -> tuple[torch.Tensor, DCPPrefillGatherPlan | None]:
+        """Compressed slot mapping of the cache tokens, and the prefill plan.
+
+        The cache tokens are this rank's tokens in a decode-only step and the
+        PCP-gathered tokens otherwise (see deepseek_v4/common/cp.py). Slots are
+        computed owner-agnostically from each rank's own tokens (the block
+        table is shared by the DCP ranks), then kept where this rank owns them.
+        """
+        assert cm.positions is not None
+        num_local = cm.slot_mapping.shape[0] // self.pcp_size
+        positions = cm.positions[:num_local]
+        self.compressed_slot_mapping_buffer.fill_(-1)
+        get_compressed_slot_mapping(
+            cm.num_actual_tokens,
+            self.cp_any_slot[:num_local],
+            cm.query_start_loc,
+            cm.seq_lens,
+            cm.block_table_tensor.clamp_(min=0),
+            int(self.kv_cache_spec.num_states),
+            self.compress_ratio,
+            out=self.compressed_slot_mapping_buffer,
+            dcp_world_size=self.dcp_size,
+            cp_interleave=self.cp_interleave,
+        )
+        local = self.compressed_slot_mapping_buffer[:num_local]
+        num_decodes, num_prefills, _, _ = split_decodes_and_prefills(
+            cm, decode_threshold=self.reorder_batch_threshold or 1
+        )
+        if num_prefills == 0:
+            out = self.cp_slot_mapping_buffer[:num_local]
+            owned = owner_mask(
+                positions, self.dcp_rank, self.dcp_size, self.cp_interleave
+            )
+            out.copy_(local).masked_fill_(~owned, PAD_SLOT_ID)
+            return out, None
+        gathered = get_pcp_group().all_gather(local, dim=0)
+        out = self.cp_slot_mapping_buffer[: gathered.shape[0]]
+        # The runner's gathered slots are PAD where this rank does not own the
+        # token or the row is a replicated copy written from another rank.
+        out.copy_(gathered).masked_fill_(cm.slot_mapping == PAD_SLOT_ID, PAD_SLOT_ID)
+        plan = None
+        if self.dcp_size > 1:
+            plan = build_dcp_prefill_gather_plan(
+                cm.req_idx,
+                cm.dcp_local_seq_lens_cpu_upper_bound,
+                cm.seq_lens_cpu_upper_bound,
+                num_decodes,
+                cm.num_reqs,
+                self.compress_ratio,
+                self.dcp_size,
+                self.cp_interleave,
+                self.device,
+            )
+        return out, plan
 
     def _build_c128a_metadata(
         self,
@@ -260,6 +352,21 @@ class DeepseekV4SparseMLAMetadataBuilder(
         assert active_topk_width >= cm.max_seq_len // self.compress_ratio
         assert active_topk_width % _C128A_TOPK_ALIGNMENT == 0
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
+        token_slots = cm.slot_mapping
+        dcp_kwargs: dict[str, int] = {}
+        if self.use_cp:
+            # The runner's slots are PAD for tokens this rank does not own;
+            # decode validity is about padding only.
+            num_local = cm.slot_mapping.shape[0] // self.pcp_size
+            token_slots = self.cp_valid_token_buffer[:num_local]
+            token_slots.fill_(-1)
+            token_slots[: cm.num_actual_tokens] = 0
+            if self.dcp_size > 1:
+                dcp_kwargs = dict(
+                    dcp_rank=self.dcp_rank,
+                    dcp_world_size=self.dcp_size,
+                    cp_interleave=self.cp_interleave,
+                )
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
             self.compress_ratio,
@@ -267,11 +374,12 @@ class DeepseekV4SparseMLAMetadataBuilder(
             req_id_per_token,
             cm.block_table_tensor[:num_decodes],
             block_size,
-            cm.slot_mapping,
+            token_slots,
             self.c128a_global_decode_buffer,
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
             max_compressed_tokens=active_topk_width,
+            **dcp_kwargs,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -290,6 +398,10 @@ class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
 
 
 class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "FLASHMLA_SPARSE_DSV4"
@@ -311,8 +423,14 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_interleave: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
+
+    Under DCP, decode tokens list this rank's compressed entries (local
+    indices through its block table); prefill tokens keep global indices.
 
     Decode tokens: position → block_table lookup → global slot ids + topk_lens.
     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
@@ -357,6 +475,9 @@ def build_c128a_topk_metadata(
         block_table,
         block_size,
         slot_mapping,
+        dcp_rank,
+        dcp_world_size,
+        cp_interleave,
     )
     return global_decode, decode_lens, prefill_local
 
@@ -398,6 +519,9 @@ class BuildC128ATopkMetadataKernel(
         block_table_stride,
         block_size,
         slot_mapping_ptr,
+        dcp_rank,
+        dcp_world_size,
+        cp_interleave,
         BLOCK_SIZE: tl.constexpr,
     ):
         token_idx = tl.program_id(0)
@@ -407,6 +531,15 @@ class BuildC128ATopkMetadataKernel(
         is_decode = token_idx < num_decode_tokens
 
         if is_decode:
+            if dcp_world_size > 1:
+                # This rank's whole groups among tokens [0, position].
+                span = cp_interleave * dcp_world_size
+                rem = (position + 1) % span - dcp_rank * cp_interleave
+                rem = tl.minimum(tl.maximum(rem, 0), cp_interleave)
+                local_tokens = (position + 1) // span * cp_interleave + rem
+                num_compressed = tl.minimum(
+                    local_tokens // compress_ratio, max_compressed_tokens
+                )
             # --- Decode: block-table lookup → global slot ids + count ---
             is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
             req_idx = tl.load(token_to_req_indices_ptr + token_idx)
@@ -493,6 +626,9 @@ class BuildC128ATopkMetadataKernel(
             block_table=TritonWarmupTensor(torch.int32, shape=(1, 1), strides=(1, 1)),
             block_size=compile_key.block_size,
             slot_mapping=TritonWarmupTensor(torch.int64),
+            dcp_rank=0,
+            dcp_world_size=1,
+            cp_interleave=1,
         )
 
     @kernel_launcher
@@ -509,6 +645,9 @@ class BuildC128ATopkMetadataKernel(
         block_table: torch.Tensor,
         block_size: int,
         slot_mapping: torch.Tensor,
+        dcp_rank: int = 0,
+        dcp_world_size: int = 1,
+        cp_interleave: int = 1,
     ) -> LaunchSpec:
         return (positions.shape[0],), dict(
             global_decode_ptr=global_decode_buffer,

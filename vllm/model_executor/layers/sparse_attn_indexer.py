@@ -1158,7 +1158,9 @@ class SparseAttnIndexer(CustomOp):
             self.use_fp4_cache,
             self.dcp_rank,
             self.dcp_world_size,
-            self.cp_kv_cache_interleave_size,
+            # The merge maps compressed entries, so the interleave is in
+            # compressed units.
+            self.cp_kv_cache_interleave_size // max(self.compress_ratio, 1),
             False,
             candidate_blocks=self.candidate_blocks,
             candidate_block_size=self.candidate_block_size,

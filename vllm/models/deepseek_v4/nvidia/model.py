@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -75,6 +76,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.cp import dsv4_uses_cp
 from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -544,6 +546,16 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if dsv4_uses_cp(vllm_config):
+        if backend not in (
+            None,
+            AttentionBackendEnum.FLASHMLA_SPARSE,
+            AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
+        ):
+            raise NotImplementedError(
+                "DeepSeek-V4 context parallelism requires FlashMLA sparse attention."
+            )
+        return DeepseekV4FlashMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -975,6 +987,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
+
+        if (
+            input_ids is not None
+            and self.parallel_config.prefill_context_parallel_size > 1
+            and not self.parallel_config.enable_expert_parallel
+        ):
+            # Without EP the MoE runs on the PCP-gathered tokens, so hash
+            # routing needs their ids too.
+            input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
         mega_gate_metadata = None
         if self.use_native_mega_moe:
