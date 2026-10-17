@@ -57,6 +57,12 @@ def get_representative_spec_type(spec: KVCacheSpec) -> type[KVCacheSpec]:
     return type(spec)
 
 
+def transfer_group_kind(spec: KVCacheSpec) -> str:
+    """Rank-independent signature of a transfer group, used to check that P
+    and D order their cache groups alike."""
+    return f"{get_representative_spec_type(spec).__name__}/{spec.block_size}"
+
+
 # Trailing 8-hex randomization suffix appended by
 # ``input_processor.assign_request_id`` as ``-{random_uuid():.8}``.
 _RANDOM_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)

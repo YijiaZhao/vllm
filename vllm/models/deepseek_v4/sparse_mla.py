@@ -289,7 +289,9 @@ class DeepseekV4SparseMLAMetadataBuilder(
         )
         local = self.compressed_slot_mapping_buffer[:num_local]
         num_decodes, num_prefills, _, _ = split_decodes_and_prefills(
-            cm, decode_threshold=self.reorder_batch_threshold or 1
+            cm,
+            decode_threshold=self.reorder_batch_threshold or 1,
+            treat_short_extends_as_decodes=False,
         )
         if num_prefills == 0:
             out = self.cp_slot_mapping_buffer[:num_local]
@@ -332,6 +334,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=not self.use_cp,
             )
         )
 

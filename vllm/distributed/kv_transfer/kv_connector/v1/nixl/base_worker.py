@@ -1075,9 +1075,7 @@ class NixlBaseConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.transfer_topo is not None
-        p_remote_ranks = self.transfer_topo.handshake_target_ranks(
-            remote_tp_size, remote_dcp_size
-        )
+        p_remote_ranks = self._handshake_target_ranks(remote_tp_size, remote_dcp_size)
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         path = make_zmq_path("tcp", host, port)
         # Clock offset to the peer, estimated from the handshake round-trip.
@@ -1198,6 +1196,14 @@ class NixlBaseConnectorWorker:
 
         assert best_offset is not None
         return remote_rank_to_agent_name, best_offset
+
+    def _handshake_target_ranks(
+        self, remote_tp_size: int, remote_dcp_size: int
+    ) -> list[int]:
+        assert self.transfer_topo is not None
+        return self.transfer_topo.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
 
     def _add_notif_only_remote_agent(
         self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1

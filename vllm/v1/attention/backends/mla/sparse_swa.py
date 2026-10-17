@@ -483,6 +483,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # decode.
         self.decode_threshold = max_decode_query_len(self.vllm_config)
         self.reorder_batch_threshold = None
+        # PCP can split a prefill into one-token chunks; those rows are still
+        # prefills, not decodes.
+        self.use_pcp = (
+            self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+        )
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -620,7 +625,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=not self.use_pcp,
             )
         )
 

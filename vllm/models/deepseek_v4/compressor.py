@@ -143,7 +143,9 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         num_decode_tokens = None
         if _prefer_two_stage_compressor():
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=1
+                common_attn_metadata,
+                decode_threshold=1,
+                treat_short_extends_as_decodes=self.pcp_size == 1,
             )
         async_spec_decode = (
             self.vllm_config.scheduler_config.async_scheduling
@@ -169,7 +171,9 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         positions = cm.positions[:num_local]
         token_to_req = padded_token_to_req(cm, self.token_to_req_indices, num_local)
         block_table = cm.block_table_tensor.clamp_(min=0)
-        _, num_prefills, _, _ = split_decodes_and_prefills(cm, decode_threshold=1)
+        _, num_prefills, _, _ = split_decodes_and_prefills(
+            cm, decode_threshold=1, treat_short_extends_as_decodes=False
+        )
         if num_prefills > 0:
             slot_mapping = cm.slot_mapping
             token_to_req = gather_token_rows(

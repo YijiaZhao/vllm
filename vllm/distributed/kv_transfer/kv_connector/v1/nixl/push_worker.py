@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    NixlAgentMetadata,
     NixlConnectorMetadata,
     RemoteMeta,
     ReqId,
@@ -59,7 +60,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
     _is_attention_spec,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_base_request_id,
+    transfer_group_kind,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -113,6 +117,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # P-side: D registrations received via NIXL notification that have
         # not yet been matched with a finished P request.
         self._pending_d_registrations: dict[ReqId, dict[str, Any]] = {}
+        # P-side: DCP-sharded decoders, engine_id -> (dcp_size, per-group
+        # dcp_sharded flags), learned from their PUSH_REG payloads.
+        self._decode_dcp_layout: dict[str, tuple[int, tuple[bool, ...]]] = {}
 
         # Cross-thread channels.
         self._reg_send_inbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
@@ -165,6 +172,53 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._sending_transfers.clear()
             self._send_failures.clear()
         super().shutdown()
+
+    # --- TP1 PCP+DCP peers ------------------------------------------- #
+    # When the decoder (or this decoder) shards MLA KV across DCP ranks, every
+    # transfer rank owns its own blocks, so ranks pair all-to-all and the
+    # TP-ratio topology does not apply (sizes need not divide each other).
+    # Remote engines are registered as a 1:1 MLA peer and
+    # ``_xfer_blocks_to_dcp_decoder`` maps the blocks per rank.
+
+    @property
+    def _is_dcp_consumer(self) -> bool:
+        return (
+            self.pcp_dcp_sharded
+            and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        )
+
+    def _handshake_target_ranks(
+        self, remote_tp_size: int, remote_dcp_size: int
+    ) -> list[int]:
+        if remote_dcp_size > 1 or self._is_dcp_consumer:
+            return list(range(remote_tp_size))
+        return super()._handshake_target_ranks(remote_tp_size, remote_dcp_size)
+
+    def add_remote_agent(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int = 0,
+        remote_tp_size: int = 1,
+        remote_dcp_size: int = 1,
+    ) -> str:
+        if remote_dcp_size > 1:
+            assert self.transfer_topo is not None
+            remote_tp_size = self.transfer_topo.tp_size
+            remote_dcp_size = self.dcp_size
+        return super().add_remote_agent(
+            nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
+        )
+
+    def _add_notif_only_remote_agent(
+        self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1
+    ) -> str:
+        if self._is_dcp_consumer:
+            assert self.transfer_topo is not None
+            remote_tp_size = self.transfer_topo.tp_size
+            remote_dcp_size = self.dcp_size
+        return super()._add_notif_only_remote_agent(
+            metadata, remote_tp_size, remote_dcp_size
+        )
 
     # --- Engine-main-thread entry point -------------------------------- #
 
@@ -362,6 +416,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         fut.add_done_callback(_on_handshake)
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
+        if self._is_dcp_consumer and self.transfer_tp_rank != 0:
+            # Every DCP rank holds the same logical block ids; one PUSH_REG
+            # per producer rank is enough.
+            return
         engine_id = reg_data["remote_engine_id"]
         notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
         # _remote_agents is mutated on other threads; snapshot under the lock.
@@ -459,6 +517,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             registration_data["decode_host"],
             registration_data["decode_port"],
             registration_data["decode_tp_size"],
+            registration_data.get("decode_dcp_size", 1),
         )
         if fut is not None:
 
@@ -483,6 +542,21 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # how pull-mode transfers touch _engine_last_active in start_load_kv.
         self._engine_last_active[decode_engine_id] = time.perf_counter()
 
+        decode_dcp_size = registration_data.get("decode_dcp_size", 1)
+        if decode_dcp_size > 1:
+            local_kinds = [
+                transfer_group_kind(g.kv_cache_spec)
+                for g in self.kv_cache_config.transfer_groups
+            ]
+            if local_kinds != registration_data["decode_group_kinds"]:
+                raise NotImplementedError(
+                    "DCP push requires P and D to order their KV cache groups "
+                    f"alike; P={local_kinds}, D={registration_data['decode_group_kinds']}"
+                )
+            self._decode_dcp_layout[decode_engine_id] = (
+                decode_dcp_size,
+                tuple(registration_data["decode_dcp_sharded_groups"]),
+            )
         logical_local = self._as_grouped_block_ids(local_block_ids)
         logical_remote = self._as_grouped_block_ids(remote_block_ids)
         physical_local = self._logical_to_kernel_block_ids(
@@ -557,6 +631,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # attention groups need widening; pure MLA writes to all handshaked
         # ranks (only the dst differs per rank).
         replicate_attn = self.use_mla and tp_ratio < 0
+        if (dcp_layout := self._decode_dcp_layout.get(engine_id)) is not None:
+            self._xfer_blocks_to_dcp_decoder(req_id, meta, dcp_layout)
+            return
         if replicate_attn and not self._has_mamba:
             assert len(plan.all_source_ranks) == 1
             write_ranks = sorted(self.dst_xfer_side_handles[engine_id])
@@ -628,6 +705,104 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             with self._sending_transfers_lock:
                 self._sending_transfers[req_id].extend(handles)
 
+    def _xfer_blocks_to_dcp_decoder(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        dcp_layout: tuple[int, tuple[bool, ...]],
+    ) -> None:
+        """WRITE a DCP-sharded MLA decoder (TP1 PCP+DCP, ranks = DCP ranks).
+
+        Both sides keep DCP-sharded groups in whole-block round robin
+        (cp_kv_cache_interleave_size == block_size): a side with DCP size
+        ``n`` stores global block ``j`` on rank ``j % n`` at the position of
+        its logical block ``j // n``. A non-CP producer is the ``n == 1`` case.
+        Replicated groups (``dcp_sharded=False``, e.g. sliding-window state)
+        go whole from producer DCP rank 0 to every decoder rank.
+
+        Every producer rank sends every decoder rank exactly one WRITE (or a
+        bare notification when it owns nothing for that rank), so the decoder
+        waits for ``pp_size * producer_dcp_size`` notifications.
+        """
+        assert meta.remote is not None and self.transfer_topo is not None
+        engine_id = meta.remote.engine_id
+        dcp_size, sharded_groups = dcp_layout
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        if self.region_group_ids != self.dst_region_group_ids[engine_id] and (
+            not self._transfer_layer_group_ids
+        ):
+            raise NotImplementedError(
+                "NixlPushConnector does not support different producer and "
+                "consumer cache-group layouts"
+            )
+        local_block_ids = meta.local_physical_block_ids
+        remote_block_ids = self._logical_to_kernel_block_ids(
+            meta.remote.block_ids,
+            remote_info.remote_physical_blocks_per_logical,
+        )
+        assert len(local_block_ids) == len(remote_block_ids) == len(sharded_groups), (
+            f"DCP push group mismatch for {req_id}: {len(local_block_ids)} local, "
+            f"{len(remote_block_ids)} remote, {len(sharded_groups)} layout groups"
+        )
+        write_ranks = sorted(self.dst_xfer_side_handles[engine_id])
+        assert len(write_ranks) == dcp_size, (write_ranks, dcp_size)
+        local_dcp_size, local_dcp_rank = self.dcp_size, self.dcp_rank
+        local_xfer_side_handle = self.src_xfer_handles_by_block_size[
+            remote_info.remote_block_size
+        ]
+        # The decoder sees one notification per producer DCP rank (per PP
+        # stage); it divides the advertised size by its own TP size (1).
+        notif_id = f"{meta.remote.request_id}:{local_dcp_size}".encode()
+        handles: list[int] = []
+        for rank in write_ranks:
+            local_ids: list[list[int]] = []
+            remote_ids: list[list[int]] = []
+            for g, sharded in enumerate(sharded_groups):
+                src = list(local_block_ids[g])
+                dst = list(remote_block_ids[g])
+                if not sharded:
+                    if local_dcp_rank != 0:
+                        src, dst = [], []
+                    else:
+                        # End-trim to D's (sliding-window clipped) tail.
+                        n = min(len(src), len(dst))
+                        src, dst = src[len(src) - n :], dst[len(dst) - n :]
+                else:
+                    pairs = [
+                        (block, dst[j // dcp_size])
+                        for i, block in enumerate(src)
+                        if (j := i * local_dcp_size + local_dcp_rank) % dcp_size
+                        == rank
+                        and j // dcp_size < len(dst)
+                    ]
+                    src = [a for a, _ in pairs]
+                    dst = [b for _, b in pairs]
+                local_ids.append(src)
+                remote_ids.append(dst)
+            if not any(local_ids):
+                agent_name = self._remote_agents[engine_id][(0, rank)]
+                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                continue
+            handle = self._xfer_blocks(
+                read_spec=ReadSpec(
+                    remote_rank=rank,
+                    local_block_ids=local_ids,
+                    remote_block_ids=remote_ids,
+                ),
+                request_id=req_id,
+                dst_engine_id=engine_id,
+                remote_request_id=meta.remote.request_id,
+                local_xfer_side_handle=local_xfer_side_handle,
+                remote_xfer_side_handle=self.dst_xfer_side_handles[engine_id][rank],
+                notif_id=notif_id,
+            )
+            if handle is not None:
+                handles.append(handle)
+        # Register the request even without handles so it completes on the
+        # next poll instead of waiting for the lease.
+        with self._sending_transfers_lock:
+            self._sending_transfers[req_id].extend(handles)
+
     def _xfer_blocks(
         self,
         read_spec: ReadSpec,
@@ -636,6 +811,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        notif_id: bytes | None = None,
     ) -> int | None:
         """Post a WRITE point-to-point xfer request.
 
@@ -658,7 +834,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 )
             )
 
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        if notif_id is None:
+            notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         if len(local_block_ids) == 0:
             logger.warning("No blocks to push for request %s", request_id)

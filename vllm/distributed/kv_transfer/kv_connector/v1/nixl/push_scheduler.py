@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import transfer_group_kind
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqId,
@@ -69,6 +70,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Per transfer group: whether D shards it across DCP ranks (P then
+        # WRITEs every DCP rank only the blocks it owns) or replicates it.
+        self._decode_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self._decode_group_kinds = [
+            transfer_group_kind(g.kv_cache_spec)
+            for g in kv_cache_config.transfer_groups
+        ]
+        self._decode_dcp_sharded_groups = [
+            self._decode_dcp_size > 1 and getattr(g.kv_cache_spec, "dcp_sharded", False)
+            for g in kv_cache_config.transfer_groups
+        ]
         if self.is_bidirectional_kv_xfer_enabled:
             raise NotImplementedError(
                 "Bidirectional KV transfer is not supported for NIXL push connector."
@@ -179,7 +191,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "decode_engine_id": self.engine_id,
             "decode_host": self.side_channel_host,
             "decode_port": self.side_channel_port,
-            "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
+            # TP1 PCP+DCP exposes its DCP shards as transfer ranks.
+            "decode_tp_size": self.transfer_tp_size,
+            "decode_dcp_size": self._decode_dcp_size,
+            "decode_dcp_sharded_groups": self._decode_dcp_sharded_groups,
+            "decode_group_kinds": self._decode_group_kinds,
             "local_block_ids": local_block_ids,
             "remote_engine_id": params["remote_engine_id"],
             "remote_host": params["remote_host"],

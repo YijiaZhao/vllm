@@ -78,8 +78,19 @@ def validate_dsv4_cp_config(vllm_config: VllmConfig) -> None:
         unsupported.append("speculative decoding")
     if vllm_config.cache_config.enable_prefix_caching:
         unsupported.append("prefix caching")
-    if vllm_config.kv_transfer_config is not None:
-        unsupported.append("KV transfer")
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is not None:
+        # P/D: NixlPushConnector moves whole 256-token pages between DCP
+        # ranks, which needs one page per interleave chunk on both sides.
+        if kv_transfer_config.kv_role not in ("kv_consumer", "kv_producer") or (
+            kv_transfer_config.kv_connector != "NixlPushConnector"
+        ):
+            unsupported.append("KV transfer other than NixlPushConnector")
+        elif interleave != 256:
+            raise ValueError(
+                "DeepSeek-V4 context parallelism with KV transfer requires "
+                f"--cp-kv-cache-interleave-size 256; got {interleave}."
+            )
     if parallel_config.pipeline_parallel_size != 1:
         unsupported.append("pipeline parallelism")
     if parallel_config.use_ubatching:

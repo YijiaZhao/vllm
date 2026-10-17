@@ -105,13 +105,22 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         parallel_config = vllm_config.parallel_config
         pcp_size = parallel_config.prefill_context_parallel_size
         kv_role = vllm_config.kv_transfer_config.kv_role
-        if pcp_size > 1 and kv_role in ("kv_consumer", "kv_both"):
-            raise NotImplementedError(
-                "NixlConnector PCP currently supports kv_producer only. "
-                "Consumers and kv_both require "
-                "prefill_context_parallel_size=1."
-            )
         dcp_size = parallel_config.decode_context_parallel_size
+        # A PCP consumer is supported only as a TP1 PCP+DCP push decoder: P
+        # WRITEs each DCP rank its own blocks of the DCP-sharded groups and
+        # every rank a full copy of the replicated ones.
+        pcp_push_consumer = (
+            kv_role == "kv_consumer"
+            and isinstance(self, NixlPushConnector)
+            and dcp_size == pcp_size
+        )
+        if pcp_size > 1 and kv_role in ("kv_consumer", "kv_both"):
+            if not pcp_push_consumer:
+                raise NotImplementedError(
+                    "NixlConnector PCP consumers require NixlPushConnector with "
+                    "TP1 and DCP spanning the PCP group. Other consumers and "
+                    "kv_both require prefill_context_parallel_size=1."
+                )
         if (
             pcp_size > 1
             and dcp_size > 1
@@ -384,9 +393,19 @@ class NixlPushConnector(NixlBaseConnector):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+        parallel_config = vllm_config.parallel_config
+        dcp_size = parallel_config.decode_context_parallel_size
+        # Only a TP1 PCP+DCP consumer (DCP ranks = transfer ranks) is
+        # supported: P splits the DCP-sharded groups per rank on WRITE.
+        dcp_push_cp = (
+            vllm_config.kv_transfer_config.kv_role in ("kv_consumer", "kv_producer")
+            and parallel_config.tensor_parallel_size == 1
+            and dcp_size == parallel_config.prefill_context_parallel_size
+        )
+        if dcp_size > 1 and not dcp_push_cp:
             raise ValueError(
-                "NixlPushConnector does not support decode_context_parallel_size > 1."
+                "NixlPushConnector supports decode_context_parallel_size > 1 only "
+                "with TP1 and the DCP group spanning the PCP group."
             )
         self.connector_scheduler: NixlPushConnectorScheduler | None = None
         self.connector_worker: NixlPushConnectorWorker | None = None
