@@ -133,6 +133,7 @@ MoEBackend = Literal[
     "flashinfer_b12x",
     "b12x",
     "flashinfer_moe_ep_mega_deep_gemm",
+    "flashinfer_moe_ep_mega_cake",
     "marlin",
     "humming",
     "triton_unfused",
@@ -148,12 +149,14 @@ MoEBackend = Literal[
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"
 FLASHINFER_MOE_EP_DEEP_GEMM = "flashinfer_moe_ep_mega_deep_gemm"
+FLASHINFER_MOE_EP_CAKE = "flashinfer_moe_ep_mega_cake"
 
 # Backends implemented by the shared FlashInfer MoE-EP adapter.
 FLASHINFER_MOE_EP_BACKENDS = frozenset(
     {
         FLASHINFER_MOE_EP_CUTEDSL,
         FLASHINFER_MOE_EP_DEEP_GEMM,
+        FLASHINFER_MOE_EP_CAKE,
     }
 )
 # Those backends dispatch and combine themselves, so the framework must not
@@ -321,6 +324,10 @@ class KernelConfig:
       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
       MXFP4 checkpoint verbatim (Blackwell, requires expert parallel;
       DeepSeek-V4 only)
+    - "flashinfer_moe_ep_mega_cake": Use the FlashInfer moe_ep
+      expert-parallel mega-MoE with the Cake SM120 MXFP4 x MXFP8 megakernel,
+      which consumes an MXFP4 checkpoint verbatim (SM120, requires expert
+      parallel)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels

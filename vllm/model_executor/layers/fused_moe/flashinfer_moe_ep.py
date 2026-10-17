@@ -10,13 +10,16 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
+    FLASHINFER_MOE_EP_CAKE,
     FLASHINFER_MOE_EP_CUTEDSL,
     FLASHINFER_MOE_EP_DEEP_GEMM,
 )
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -30,21 +33,27 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
+FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm", "cake"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4"]
 _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
     kNvfp4Static: "nvfp4",
     kMxfp4Static: "mxfp4",
 }
 
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SM100_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SM120_CAPABILITIES = frozenset({(12, 0), (12, 1)})
+
+
+def _current_capability() -> tuple[int, int] | None:
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return None
+    return (capability.major, capability.minor)
 
 
 def supports_current_device() -> bool:
-    capability = current_platform.get_device_capability()
-    return capability is not None and (
-        (capability.major, capability.minor) in _SUPPORTED_CAPABILITIES
-    )
+    capability = _current_capability()
+    return any(capability in spec.capabilities for spec in _BACKEND_SPECS.values())
 
 
 _E2M1_LUT = (
@@ -71,6 +80,7 @@ _E2M1_LUT = (
 class FlashInferMoeEpBackendSpec:
     kernel: FlashInferMoeEpKernel
     weight_formats: frozenset[FlashInferMoeEpWeightFormat]
+    capabilities: frozenset[tuple[int, int]] = _SM100_CAPABILITIES
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,11 @@ _BACKEND_SPECS = {
     FLASHINFER_MOE_EP_DEEP_GEMM: FlashInferMoeEpBackendSpec(
         kernel="deep_gemm",
         weight_formats=frozenset({"mxfp4"}),
+    ),
+    FLASHINFER_MOE_EP_CAKE: FlashInferMoeEpBackendSpec(
+        kernel="cake",
+        weight_formats=frozenset({"mxfp4"}),
+        capabilities=_SM120_CAPABILITIES,
     ),
 }
 
@@ -131,6 +146,9 @@ def flashinfer_moe_ep_unsupported_reasons(
     """
     spec = flashinfer_moe_ep_backend_spec(moe.moe_backend)
     unsupported: list[str] = []
+    capability = _current_capability()
+    if capability not in spec.capabilities:
+        unsupported.append(f"compute capability {capability}")
     weight_format = _WEIGHT_FORMATS.get(weight_key)
     if weight_format is None:
         unsupported.append(f"weight scheme {weight_key}")
@@ -157,7 +175,13 @@ def flashinfer_moe_ep_unsupported_reasons(
         unsupported.append("runtime weight transfer")
     if vllm_config.parallel_config.enable_dbo:
         unsupported.append("dual batch overlap")
-    if spec.kernel == "deep_gemm" and vllm_config.parallel_config.enable_eplb:
+    if spec.kernel == "cake":
+        if moe.num_experts % moe.moe_parallel_config.ep_size:
+            unsupported.append("experts not divisible by the EP size")
+        limit = moe.swiglu_limit
+        if limit is not None and (limit < 0 or limit != int(limit)):
+            unsupported.append(f"non-integral swiglu_limit {limit}")
+    if spec.kernel != "cutedsl" and vllm_config.parallel_config.enable_eplb:
         unsupported.append("EPLB")
     return tuple(unsupported)
 
@@ -231,7 +255,7 @@ def mxfp4_moe_ep_weights(
     w2_scale: torch.Tensor,
 ) -> FlashInferMoeEpWeights:
     spec = flashinfer_moe_ep_backend_spec(moe_backend)
-    if spec.kernel == "deep_gemm":
+    if spec.kernel in ("deep_gemm", "cake"):
         return FlashInferMoeEpWeights(w13, w2, w13_scale, w2_scale)
     return FlashInferMoeEpWeights(
         w13=_dequant_mxfp4_experts(w13, w13_scale),
@@ -266,6 +290,11 @@ class _FlashInferMoeEpApi:
         self.MoEEpTensors = MoEEpTensors
         self.MoEWeightPack = MoEWeightPack
         self.Nvfp4CutedslMegaMoeConfig = Nvfp4CutedslMegaMoeConfig
+        try:
+            from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
+        except ImportError:
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig = None
+        self.CakeMegaMoeConfig = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
 
 
 def _load_flashinfer_moe_ep_api() -> _FlashInferMoeEpApi:
@@ -314,7 +343,27 @@ class FlashInferMoeEp:
             w13_scale=weights.w13_scale,
             w2_scale=weights.w2_scale,
         )
-        if spec.kernel == "cutedsl":
+        if spec.kernel == "cake":
+            if api.CakeMegaMoeConfig is None:
+                raise RuntimeError(
+                    f"{moe.moe_backend} requires a FlashInfer build exporting "
+                    "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig "
+                    "(flashinfer-ai/flashinfer#6346)"
+                )
+            # The Cake kernel reads UE8M0 exponent bytes.
+            weight_pack = api.MoEWeightPack(
+                w13=weights.w13.view(torch.uint8),
+                w2=weights.w2.view(torch.uint8),
+                w13_scale=_ue8m0_bytes(weights.w13_scale),
+                w2_scale=_ue8m0_bytes(weights.w2_scale),
+            )
+            megakernel = api.CakeMegaMoeConfig(
+                intermediate_size=moe.intermediate_size,
+                top_k=moe.experts_per_token,
+                swiglu_limit=int(moe.swiglu_limit or 0),
+                transport_table=envs.VLLM_FLASHINFER_MOE_EP_CAKE_TRANSPORT_TABLE,
+            )
+        elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
             # renamed in_kernel_fc2_reduce to enable_in_kernel_fc2_reduce.
             megakernel = api.Nvfp4CutedslMegaMoeConfig(
@@ -357,6 +406,9 @@ class FlashInferMoeEp:
         self._top_k = moe.experts_per_token
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+        # Cake stages each call with a token bound shared by every EP rank, so
+        # a call needs no routing exchange and can be captured in a graph.
+        self._bucketed = spec.kernel == "cake"
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -403,6 +455,15 @@ class FlashInferMoeEp:
                 f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
                 f"the workspace supports at most {self._max_num_tokens}"
             )
+        if self._bucketed:
+            tensors = self._tensors(
+                hidden_states, topk_ids.to(torch.int64), topk_weights
+            )
+            self._mega_layer.stage_inputs(
+                tensors,
+                compile_tokens_per_rank=_ep_token_bound(hidden_states.shape[0]),
+            )
+            return self._mega_layer.compute_staged(output=None)
         tensors = self._tensors(hidden_states, topk_ids, topk_weights)
         if self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
@@ -421,7 +482,11 @@ class FlashInferMoeEp:
             device=self._device,
         )
         topk_ids = (
-            torch.arange(self._top_k, dtype=torch.int32, device=self._device)
+            torch.arange(
+                self._top_k,
+                dtype=torch.int64 if self._bucketed else torch.int32,
+                device=self._device,
+            )
             .mul_(self._num_experts // self._top_k)
             .view(1, self._top_k)
         )
@@ -443,7 +508,15 @@ class FlashInferMoeEp:
         """
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
-        (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = self._mega_layer._transformed
+        transformed = self._mega_layer._transformed
+        if self._bucketed:
+            return (
+                transformed.w1_fp4.view(torch.uint8),
+                transformed.w1_sfb,
+                transformed.w2_fp4.view(torch.uint8),
+                transformed.w2_sfb,
+            )
+        (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = transformed
         return (
             _expert_major_bytes(fc1_weight),
             _expert_major_bytes(fc1_sf),
@@ -468,6 +541,33 @@ class FlashInferMoeEp:
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self.destroy()
+
+
+def _ue8m0_bytes(scale: torch.Tensor | None) -> torch.Tensor:
+    """UE8M0 exponent bytes of MX block scales."""
+    assert scale is not None
+    if scale.dtype == torch.uint8:
+        return scale
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.view(torch.uint8)
+    exponents = scale.to(torch.float8_e8m0fnu)
+    if not torch.equal(exponents.to(scale.dtype), scale):
+        raise ValueError("MX block scales must be powers of two (UE8M0)")
+    return exponents.view(torch.uint8)
+
+
+def _ep_token_bound(num_tokens: int) -> int:
+    """A per-call token bound equal on every EP rank.
+
+    DP ranks pad to a common count only when they share a CUDA graph size, so
+    take the largest; without DP the EP ranks are TP/PCP ranks of one batch,
+    and PCP pads every rank's slice to the same length.
+    """
+    if is_forward_context_available():
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is not None:
+            return max(num_tokens, int(dp_metadata.num_tokens_across_dp_cpu.max()))
+    return num_tokens
 
 
 def _expert_major_bytes(tensor: torch.Tensor) -> torch.Tensor:

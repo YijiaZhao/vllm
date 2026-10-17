@@ -2,19 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+import math
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.cp import (
+    DCPPrefillGatherPlan,
+    dcp_local_topk_indices_and_lens,
+    dcp_merge_decode,
+)
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
     compute_global_topk_indices_and_lens,
+)
+from vllm.models.deepseek_v4.nvidia.flashmla import (
+    DeepseekSparseSWAFlashMLAMetadataBuilder,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -35,7 +45,6 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
-    DeepseekSparseSWAMetadataBuilder,
 )
 
 if TYPE_CHECKING:
@@ -141,6 +150,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         return capability.major in [10, 12]
 
     @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_combination(
         cls,
         head_size: int,
@@ -186,13 +199,23 @@ class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBu
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
-class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
-    """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
+class DeepseekSparseSWAFlashInferMetadataBuilder(
+    DeepseekSparseSWAFlashMLAMetadataBuilder
+):
+    """SWA metadata for the FlashInfer sparse decode path (varlen decode).
+
+    Shares the FlashMLA builder's PCP handling: the window cache is
+    replicated, so queries use rank-local slots and writes the gathered ones.
+    """
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
         return DeepseekSparseSWAFlashInferMetadataBuilder
@@ -669,6 +692,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "flashinfer-ai/flashinfer#4380."
             )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+        parallel_config = vllm_config.parallel_config
+        self.dcp_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.cp_interleave = parallel_config.cp_kv_cache_interleave_size
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
             return
@@ -810,6 +837,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         extra_sparse_indices = None
         extra_sparse_lengths = None
+        # DCP: the compressed KV is sharded, so each rank attends over its own
+        # entries (plus, on rank 0, the replicated window) and the partial
+        # results are merged by LSE.
+        use_dcp = self.dcp_size > 1 and not swa_only
         if not swa_only:
             if attn_metadata is None:
                 raise RuntimeError(
@@ -820,7 +851,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     "SWA validity metadata is required for compressed layers."
                 )
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
+            if self.compress_ratio == 4 and use_dcp:
+                assert self.topk_indices_buffer is not None
+                topk = self.topk_indices_buffer[:num_decode_tokens]
+                local_indices, extra_sparse_lengths = dcp_local_topk_indices_and_lens(
+                    topk,
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    attn_metadata.block_size // self.compress_ratio,
+                    is_valid,
+                    self.cp_interleave // self.compress_ratio,
+                    out=torch.empty_like(topk),
+                    lens=torch.empty(
+                        num_decode_tokens, dtype=torch.int32, device=topk.device
+                    ),
+                )
+                extra_sparse_indices = local_indices.view(num_decode_tokens, 1, -1)
+            elif self.compress_ratio == 4:
                 if self.topk_indices_buffer is None:
                     raise RuntimeError(
                         "C4A decode requires top-k indices from the indexer."
@@ -844,6 +891,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
+        if use_dcp and self.dcp_rank != 0:
+            assert swa_metadata.dcp_zero_decode_swa_lens is not None
+            swa_lens = swa_metadata.dcp_zero_decode_swa_lens
         q = self._prepare_query(q, output)
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
@@ -851,6 +901,28 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        if use_dcp:
+            assert extra_sparse_lengths is not None
+            heads = self.n_local_heads
+            out, lse = _sm120_sparse_mla_with_lse(
+                q,
+                swa_cache,
+                self._get_workspace(q.device),
+                swa_indices,
+                swa_lens,
+                extra_cache,
+                extra_sparse_indices,
+                extra_sparse_lengths,
+                self.scale,
+            )
+            out = out.view(num_decode_tokens, -1, out.shape[-1])[:, :heads]
+            lse = lse.view(num_decode_tokens, -1)[:, :heads]
+            # Rows without a single local entry drop out of the merge.
+            empty = (swa_lens + extra_sparse_lengths) == 0
+            out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
+            lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
+            output[:, :heads].copy_(dcp_merge_decode(out, lse, self.attn_sink))
+            return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
@@ -915,11 +987,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // self.compress_ratio
+            token_to_req = swa_metadata.token_to_req_indices[prefill_token_slice]
+            block_table = attn_metadata.block_table
+            if self.dcp_size > 1:
+                # DCP: every prefill request's compressed pages, gathered from
+                # all ranks into a temporary pool with a global block table.
+                assert compressed_k_cache is not None
+                plan = attn_metadata.dcp_prefill_plan
+                assert plan is not None
+                compressed_k_cache, block_table = self._dcp_gather_prefill_pages(
+                    compressed_k_cache, attn_metadata.block_table, plan, block_size
+                )
+                token_to_req = plan.row_to_req[token_to_req.long() - num_decodes]
             extra_sparse_indices, extra_sparse_lengths = (
                 compute_global_topk_indices_and_lens(
                     local_topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_token_slice],
-                    attn_metadata.block_table,
+                    token_to_req,
+                    block_table,
                     block_size,
                     swa_metadata.is_valid_token[prefill_token_slice],
                 )
@@ -984,3 +1068,80 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+
+    def _dcp_gather_prefill_pages(
+        self,
+        compressed_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        plan: DCPPrefillGatherPlan,
+        entries_per_page: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather the prefill requests' compressed pages from every DCP rank.
+
+        With a 256-token interleave each global page lives whole on one rank
+        (global page ``j`` is local page ``j // dcp`` of rank ``j % dcp``), so
+        pages are copied verbatim. Returns the gathered page pool and a
+        ``[num_prefill_reqs, num_global_pages]`` block table into it.
+        """
+        dcp = self.dcp_size
+        assert self.cp_interleave // self.compress_ratio == entries_per_page, (
+            "SM120 DCP prefill needs --cp-kv-cache-interleave-size 256"
+        )
+        num_reqs = plan.req_rows.shape[0]
+        local_pages = (int(plan.shard_rows.max()) + entries_per_page - 1) // (
+            entries_per_page
+        )
+        local_table = block_table[plan.req_rows.long(), :local_pages].clamp(min=0)
+        pages = compressed_k_cache[local_table.long()]
+        gathered = get_dcp_group().all_gather(pages.unsqueeze(0), dim=0)
+        pool = gathered.view(-1, *compressed_k_cache.shape[1:])
+        j = torch.arange(local_pages * dcp, device=block_table.device)
+        u = torch.arange(num_reqs, device=block_table.device).unsqueeze(1)
+        global_table = ((j % dcp) * num_reqs + u) * local_pages + j // dcp
+        return pool, global_table.to(block_table.dtype)
+
+
+def _sm120_sparse_mla_with_lse(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    workspace: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_lens: torch.Tensor | None,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM120 packed sparse MLA without sink; returns (out, base-e LSE).
+
+    The public DSV4 entry point does not expose the LSE, so this calls the
+    SM120 runner it wraps with the same segments.
+    """
+    from flashinfer.mla._core import (
+        _SparseMLASegment,
+        _trtllm_batch_decode_sparse_mla_sm120,
+    )
+
+    segments = [_SparseMLASegment(indices=swa_indices, lengths=swa_lens)]
+    if extra_indices is not None:
+        segments.append(
+            _SparseMLASegment(
+                indices=extra_indices, lengths=extra_lens, kv_cache=extra_cache
+            )
+        )
+    query = q.unsqueeze(1)
+    out, lse = _trtllm_batch_decode_sparse_mla_sm120(
+        query=query,
+        kv_cache=swa_cache,
+        workspace_buffer=workspace,
+        sparse_mla_segments=segments,
+        out=torch.empty_like(query),
+        sm_scale=scale,
+        sinks=None,
+        lse=None,
+        return_lse=True,
+        lse_scale=math.log(2),
+        kv_scale_format="auto",
+        kv_cache_format="fp8",
+    )
+    return out, lse

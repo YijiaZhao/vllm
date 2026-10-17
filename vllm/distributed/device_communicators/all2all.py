@@ -3,7 +3,7 @@
 import os
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,10 +41,14 @@ if has_flashinfer_nvlink_two_sided():
 if has_flashinfer_nvlink_one_sided():
     from flashinfer.comm import Mapping  # type: ignore[import-not-found]
     from flashinfer.comm.mnnvl import MnnvlConfig  # type: ignore[import-not-found]
-    from flashinfer.comm.trtllm_moe_alltoall import (
-        MoeAlltoAll,  # type: ignore[import-not-found]
-        moe_a2a_get_workspace_size_per_rank,
-    )
+
+    # FlashInfer after 0.7.2 dropped the MoeAlltoAll class; only the
+    # one-sided NVLink all2all manager needs it.
+    with suppress(ImportError):
+        from flashinfer.comm.trtllm_moe_alltoall import (
+            MoeAlltoAll,  # type: ignore[import-not-found]
+            moe_a2a_get_workspace_size_per_rank,
+        )
 
 
 logger = init_logger(__name__)

@@ -73,6 +73,20 @@ def validate_dsv4_cp_config(vllm_config: VllmConfig) -> None:
                 "--cp-kv-cache-interleave-size to be a multiple of every compress "
                 f"ratio {sorted(ratios)}; got {interleave}."
             )
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    if (
+        capability is not None
+        and capability.major == 12
+        and parallel_config.decode_context_parallel_size > 1
+        and interleave != 256
+    ):
+        # The SM120 prefill gathers whole compressed pages across DCP ranks.
+        raise ValueError(
+            "DeepSeek-V4 DCP on SM120 requires --cp-kv-cache-interleave-size 256; "
+            f"got {interleave}."
+        )
     unsupported = []
     if vllm_config.speculative_config is not None:
         unsupported.append("speculative decoding")

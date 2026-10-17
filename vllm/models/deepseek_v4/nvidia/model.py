@@ -547,6 +547,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
     if dsv4_uses_cp(vllm_config):
+        if device_capability is not None and device_capability.major == 12:
+            # SM120 has no FlashMLA; its FlashInfer path implements CP.
+            return DeepseekV4FlashInferSM120Attention
         if backend not in (
             None,
             AttentionBackendEnum.FLASHMLA_SPARSE,
