@@ -456,9 +456,15 @@ class FlashInferMoeEp:
                 f"the workspace supports at most {self._max_num_tokens}"
             )
         if self._bucketed:
-            tensors = self._tensors(
-                hidden_states, topk_ids.to(torch.int64), topk_weights
-            )
+            topk_ids = topk_ids.to(torch.int64)
+            is_padding = _padding_mask(hidden_states.shape[0])
+            if is_padding is not None:
+                # Padded rows (CUDA graph / PCP padding) carry stale activations;
+                # routing them can overflow the kernel's lossless BF16 return
+                # codec, which sets protocol_error and desyncs the peers' signal
+                # bookkeeping (a hang). -1 is the kernel's masked route.
+                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+            tensors = self._tensors(hidden_states, topk_ids, topk_weights)
             self._mega_layer.stage_inputs(
                 tensors,
                 compile_tokens_per_rank=_ep_token_bound(hidden_states.shape[0]),
@@ -554,6 +560,16 @@ def _ue8m0_bytes(scale: torch.Tensor | None) -> torch.Tensor:
     if not torch.equal(exponents.to(scale.dtype), scale):
         raise ValueError("MX block scales must be powers of two (UE8M0)")
     return exponents.view(torch.uint8)
+
+
+def _padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """The forward context's padding rows over this call's tokens, if any."""
+    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+        return None
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or is_padding.shape[0] < num_tokens:
+        return None
+    return is_padding[:num_tokens]
 
 
 def _ep_token_bound(num_tokens: int) -> int:

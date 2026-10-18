@@ -115,6 +115,17 @@ def validate_dsv4_cp_config(vllm_config: VllmConfig) -> None:
         )
 
 
+def real_token_count(cm: "CommonAttentionMetadata") -> int:
+    """Tokens of the step's requests, excluding CUDA graph padding.
+
+    ``num_actual_tokens`` counts the padded tokens of a FULL graph batch, whose
+    request rows map to request 0 and whose positions are 0: writing their
+    replicated cache slots would land in that request's stale (since freed and
+    reassigned) sliding-window blocks.
+    """
+    return int(cm.query_start_loc_cpu[-1])
+
+
 def owner_mask(
     positions: torch.Tensor, rank: int, world_size: int, interleave: int
 ) -> torch.Tensor:

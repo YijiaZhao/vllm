@@ -15,6 +15,7 @@ from vllm.models.deepseek_v4.common.cp import (
     dcp_merge_decode,
     gather_token_rows,
     padded_token_to_req,
+    real_token_count,
     replicated_slot_mapping,
 )
 from vllm.models.deepseek_v4.common.ops import (
@@ -107,7 +108,7 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekSparseSWAMetadataBuilder)
             token_to_req,
             cm.block_table_tensor,
             self.block_size,
-            cm.num_actual_tokens,
+            real_token_count(cm),
         )
         metadata = super().build(
             common_prefix_len,
@@ -124,7 +125,7 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekSparseSWAMetadataBuilder)
             metadata.cache_token_to_req = gather_token_rows(
                 token_to_req,
                 num_local,
-                cm.num_actual_tokens,
+                real_token_count(cm),
                 cm.req_idx,
                 cm.num_reqs,
                 self.req_lookup,

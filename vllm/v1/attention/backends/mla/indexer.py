@@ -1330,7 +1330,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.pcp_world_size * max_tokens, dtype=torch.int64, device=self.device
             )
         get_compressed_slot_mapping(
-            cm.num_actual_tokens,
+            int(cm.query_start_loc_cpu[-1]),
             self._pcp_any_slot[:num_local],
             cm.query_start_loc,
             cm.seq_lens,

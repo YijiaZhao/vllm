@@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.common.cp import (
     DCPPrefillGatherPlan,
     build_dcp_prefill_gather_plan,
     owner_mask,
+    real_token_count,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -276,7 +277,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
         positions = cm.positions[:num_local]
         self.compressed_slot_mapping_buffer.fill_(-1)
         get_compressed_slot_mapping(
-            cm.num_actual_tokens,
+            real_token_count(cm),
             self.cp_any_slot[:num_local],
             cm.query_start_loc,
             cm.seq_lens,
@@ -363,7 +364,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
             num_local = cm.slot_mapping.shape[0] // self.pcp_size
             token_slots = self.cp_valid_token_buffer[:num_local]
             token_slots.fill_(-1)
-            token_slots[: cm.num_actual_tokens] = 0
+            token_slots[: real_token_count(cm)] = 0
             if self.dcp_size > 1:
                 dcp_kwargs = dict(
                     dcp_rank=self.dcp_rank,

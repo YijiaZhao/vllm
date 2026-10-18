@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.cp import (
     gather_token_rows,
     padded_token_to_req,
+    real_token_count,
     replicated_slot_mapping,
 )
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
@@ -179,7 +180,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             token_to_req = gather_token_rows(
                 token_to_req,
                 num_local,
-                cm.num_actual_tokens,
+                real_token_count(cm),
                 cm.req_idx,
                 cm.num_reqs,
                 self.req_lookup,
@@ -192,7 +193,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 token_to_req,
                 block_table,
                 self.block_size,
-                cm.num_actual_tokens,
+                real_token_count(cm),
             )
         return CompressorMetadata(
             block_table=block_table,
