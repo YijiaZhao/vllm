@@ -253,7 +253,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # resolve every CUDA Graph bucket before capture begins.
     # Lazy import: flashinfer_pcie_ipc_all_reduce imports flashinfer.comm,
     # which initializes CUDA at import time and must not run at module scope.
-    if envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC:
+    from vllm.distributed.parallel_state import get_dcp_group
+
+    dcp_comm = get_dcp_group().device_communicator
+    if envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC or (
+        getattr(dcp_comm, "fi_pcie_ipc_ar_comm", None) is not None
+    ):
         from vllm.distributed.device_communicators import (
             flashinfer_pcie_ipc_all_reduce,
         )

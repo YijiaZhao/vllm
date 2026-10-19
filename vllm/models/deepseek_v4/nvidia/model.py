@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
+    get_dcp_group,
     get_ep_group,
     get_pcp_group,
     get_pp_group,
@@ -76,7 +77,18 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.common.cp import dsv4_uses_cp
+from vllm.models.deepseek_v4.common.cp import (
+    dcp_all_reduce,
+    dcp_decode_ar_active,
+    dcp_decode_ar_supported,
+    dcp_decode_sp_active,
+    dcp_decode_sp_supported,
+    dcp_sp_all_gather,
+    dcp_sp_padding_mask,
+    dcp_sp_reduce_scatter,
+    dcp_sp_shard,
+    dsv4_uses_cp,
+)
 from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -177,8 +189,14 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        # Decode AR (deepseek_v4/common/cp.py): this DCP rank's slice of the
+        # intermediate, whose partial sum the MoE all-reduces with the routed
+        # experts'.
+        self.dcp_part: DeepseekV4MLP | None = None
 
     def forward(self, x):
+        if self.dcp_part is not None and dcp_decode_ar_active():
+            return self.dcp_part(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -334,6 +352,18 @@ class DeepseekV4MoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
+            if dcp_decode_ar_supported(vllm_config):
+                self.shared_experts.dcp_part = DeepseekV4MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size
+                    // get_dcp_group().world_size,
+                    hidden_act=config.hidden_act,
+                    swiglu_limit=self.swiglu_limit,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    is_sequence_parallel=True,
+                    prefix=f"{prefix}.shared_experts.dcp_part",
+                )
 
         if self.use_native_mega_moe:
             self._init_mega_moe_experts(vllm_config, config, prefix)
@@ -532,6 +562,9 @@ class DeepseekV4MoE(nn.Module):
             router_logits=hidden_states,
             input_ids=input_ids,
         )
+        if dcp_decode_ar_active():
+            # Routed and shared partial sums of this DCP rank.
+            final_hidden_states = dcp_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(org_shape)
 
@@ -610,6 +643,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.dcp_decode_sp = dcp_decode_sp_supported(vllm_config)
+        self.dcp_decode_ar = dcp_decode_ar_supported(vllm_config)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = _select_dsv4_attn_cls(vllm_config)(
@@ -791,12 +826,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
 
+        dcp_sp = self.dcp_decode_sp and dcp_decode_sp_active()
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+        elif dcp_sp and not self.dcp_decode_ar:
+            x = dcp_sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        elif dcp_sp and self.dcp_decode_ar:
+            x = dcp_all_reduce(x)
+        elif dcp_sp:
+            x = dcp_sp_reduce_scatter(x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -838,6 +880,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.dcp_decode_sp = dcp_decode_sp_supported(vllm_config)
+        self.dcp_decode_ar = dcp_decode_ar_supported(vllm_config)
         if (
             self.use_native_mega_moe
             and not vllm_config.parallel_config.enable_expert_parallel
@@ -990,6 +1034,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
+        dcp_sp = self.dcp_decode_sp and dcp_decode_sp_active()
+        if dcp_sp and self.dcp_decode_ar:
+            # Decode AR: tokens stay replicated; the MoE all-reduces.
+            get_forward_context().dsv4_dcp_decode_ar = True
+            dcp_sp = False
+        if dcp_sp:
+            # Decode SP (deepseek_v4/common/cp.py): every layer but attention
+            # runs on this DCP rank's token shard.
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = dcp_sp_padding_mask(
+                    forward_context.is_padding, full_num_tokens, hidden_states.device
+                )
+            hidden_states = dcp_sp_shard(hidden_states)
+            input_ids = dcp_sp_shard(input_ids)
 
         if (
             input_ids is not None
@@ -1035,6 +1094,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                elif dcp_sp:
+                    aux_hidden_state = dcp_sp_all_gather(aux_hidden_state)[
+                        :full_num_tokens
+                    ]
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
         if layer is not None:
@@ -1056,6 +1119,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif dcp_sp:
+            hidden_states = dcp_sp_all_gather(hidden_states)[:full_num_tokens]
 
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
@@ -1132,6 +1197,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(name)
+                dcp_name = name.replace(
+                    ".shared_experts.gate_up_proj.", ".shared_experts.dcp_part.gate_up_proj."
+                )
+                if dcp_name != name and dcp_name in params_dict:
+                    dcp_group = get_dcp_group()
+                    chunk = loaded_weight.shape[0] // dcp_group.world_size
+                    dcp_param = params_dict[dcp_name]
+                    dcp_param.weight_loader(
+                        dcp_param,
+                        loaded_weight.narrow(0, dcp_group.rank_in_group * chunk, chunk),
+                        shard_id,
+                    )
+                    loaded_params.add(dcp_name)
                 break
             else:
                 if ".experts." in name:
@@ -1187,9 +1265,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                    if self.dcp_decode_sp:
+                        dcp_name = self._load_dcp_sp_slice(
+                            name, loaded_weight, params_dict
+                        )
+                        if dcp_name is not None:
+                            loaded_params.add(dcp_name)
                     continue
 
         return loaded_params
+
+    # Decode SP weight slices (DeepseekV4Attention.wq_b_dcp & co.): module,
+    # its copy, and the dimension cut by DCP rank.
+    _DCP_SP_SLICES = (
+        (".attn.wo_a.", ".attn.wo_a_dcp.", 0),
+        (".attn.wo_b.", ".attn.wo_b_dcp.", 1),
+        (".shared_experts.down_proj.", ".shared_experts.dcp_part.down_proj.", 1),
+    )
+
+    def _load_dcp_sp_slice(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+    ) -> str | None:
+        for src, dst, dim in self._DCP_SP_SLICES:
+            dcp_name = name.replace(src, dst)
+            if dcp_name == name or dcp_name not in params_dict:
+                continue
+            if loaded_weight.ndim > dim:
+                dcp_group = get_dcp_group()
+                chunk = loaded_weight.shape[dim] // dcp_group.world_size
+                loaded_weight = loaded_weight.narrow(
+                    dim, dcp_group.rank_in_group * chunk, chunk
+                )
+            param = params_dict[dcp_name]
+            getattr(param, "weight_loader", default_weight_loader)(
+                param, loaded_weight
+            )
+            return dcp_name
+        return None
 
     @staticmethod
     def _pad_shared_expert_weight(

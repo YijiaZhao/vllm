@@ -19,6 +19,8 @@ from vllm.models.deepseek_v4.common.cp import (
     DCPPrefillGatherPlan,
     dcp_local_topk_indices_and_lens,
     dcp_merge_decode,
+    dcp_sp_local_scale_decode,
+    dcp_sp_merge_decode,
 )
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
@@ -924,10 +926,34 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             out = out.view(num_decode_tokens, -1, out.shape[-1])[:, :heads]
             lse = lse.view(num_decode_tokens, -1)[:, :heads]
             # Rows without a single local entry drop out of the merge.
-            empty = (swa_lens + extra_sparse_lengths) == 0
-            out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
-            lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
-            output[:, :heads].copy_(dcp_merge_decode(out, lse, self.attn_sink))
+            if self._dcp_sp_step() and self.dcp_sp_merge_workspace is not None:
+                # Decode SP: all heads of this rank's weighted partial, or this
+                # rank's heads of the merge, for its wo_a groups.
+                self.dcp_sp_attn_out = dcp_sp_local_scale_decode(
+                    out, lse, swa_lens, extra_sparse_lengths, self.attn_sink
+                )
+                if self.dcp_sp_attn_out is None:
+                    self.dcp_sp_attn_out = dcp_sp_merge_decode(
+                        out,
+                        lse,
+                        swa_lens,
+                        extra_sparse_lengths,
+                        self.attn_sink,
+                        self.dcp_sp_merge_workspace,
+                    )
+            else:
+                empty = (swa_lens + extra_sparse_lengths) == 0
+                out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
+                lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
+                if self._dcp_sp_step():
+                    start, end = self.dcp_sp_heads
+                    output[:, start:end].copy_(
+                        dcp_merge_decode(out, lse, self.attn_sink, scatter_heads=True)
+                    )
+                else:
+                    output[:, :heads].copy_(
+                        dcp_merge_decode(out, lse, self.attn_sink)
+                    )
             return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,

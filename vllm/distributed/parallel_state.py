@@ -1700,10 +1700,19 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
+    # The DCP group joins only when a model gave it a custom all-reduce.
+    dcp_comm = _DCP.device_communicator if _DCP is not None else None
+    maybe_dcp_context = (
+        _DCP.graph_capture(context)
+        if getattr(dcp_comm, "ca_comm", None) is not None
+        or getattr(dcp_comm, "fi_pcie_ipc_ar_comm", None) is not None
+        else nullcontext()
+    )
     with (
         get_tp_group().graph_capture(context),
         get_pp_group().graph_capture(context),
         get_dp_group().graph_capture(context),
+        maybe_dcp_context,
     ):
         yield context
 

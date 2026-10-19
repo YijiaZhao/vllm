@@ -23,6 +23,15 @@ from vllm.v1.worker.ubatching import (
 )
 
 
+def _dsv4_dcp_decode_ar() -> bool:
+    """DeepSeek-V4 decode AR step: tokens replicated across the EP (= DCP)
+    ranks, so each rank runs its experts on every token; the model
+    all-reduces."""
+    from vllm.models.deepseek_v4.common.cp import dcp_decode_ar_active
+
+    return dcp_decode_ar_active()
+
+
 def _quantize_and_setup_dispatch(
     a1: torch.Tensor,
     quant_config: FusedMoEQuantConfig,
@@ -207,6 +216,14 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 ]
             )
 
+        if _dsv4_dcp_decode_ar():
+            # Tokens are already on every rank; finalize all-reduces.
+            if scales is not None:
+                a1q_scale_orig = _unwrap_scale_and_prepare_for_moe(
+                    scales, quant_config
+                )
+            return a1q, a1q_scale_orig, None, topk_ids, topk_weights
+
         extra_tensors: list[torch.Tensor] | None = None
         if scales is not None:
             extra_tensors = list(scales)
@@ -276,6 +293,11 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
+        if _dsv4_dcp_decode_ar():
+            # The model all-reduces the routed and shared partial sums.
+            output.copy_(out)
+            return
+
         with self._comm_region():
             get_ep_group().combine_into_output(
                 out,
@@ -327,6 +349,12 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         a1q, scales, a1q_scale_orig = _quantize_and_setup_dispatch(
             a1, quant_config, defer_input_quant
         )
+        if _dsv4_dcp_decode_ar():
+            if scales is not None:
+                a1q_scale_orig = _unwrap_scale_and_prepare_for_moe(
+                    scales, quant_config
+                )
+            return a1q, a1q_scale_orig, router_logits
 
         res = get_ep_group().dispatch_router_logits(
             a1q,
@@ -350,6 +378,8 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         self,
         fused_expert_output: torch.Tensor,
     ) -> torch.Tensor:
+        if _dsv4_dcp_decode_ar():
+            return fused_expert_output
         out = get_ep_group().combine(
             fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
         )

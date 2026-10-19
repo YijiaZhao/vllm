@@ -13,6 +13,8 @@ from vllm.models.deepseek_v4.common.cp import (
     DCPPrefillGatherPlan,
     dcp_local_topk_indices_and_lens,
     dcp_merge_decode,
+    dcp_sp_local_scale_decode,
+    dcp_sp_merge_decode,
     gather_token_rows,
     padded_token_to_req,
     real_token_count,
@@ -399,10 +401,34 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             lse = _flashmla_lse_2d(lse, num_decode_tokens)[:, :heads]
             # Rows without a single local entry have undefined out/lse;
             # (0, -inf) drops this rank from their merge.
-            empty = (swa_lens + topk_lens) == 0
-            out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
-            lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
-            output[:, :heads].copy_(dcp_merge_decode(out, lse, self.attn_sink))
+            if self._dcp_sp_step() and self.dcp_sp_merge_workspace is not None:
+                # Decode SP: all heads of this rank's weighted partial, or this
+                # rank's heads of the merge, for its wo_a groups.
+                self.dcp_sp_attn_out = dcp_sp_local_scale_decode(
+                    out, lse, swa_lens, topk_lens, self.attn_sink
+                )
+                if self.dcp_sp_attn_out is None:
+                    self.dcp_sp_attn_out = dcp_sp_merge_decode(
+                        out,
+                        lse,
+                        swa_lens,
+                        topk_lens,
+                        self.attn_sink,
+                        self.dcp_sp_merge_workspace,
+                    )
+            else:
+                empty = (swa_lens + topk_lens) == 0
+                out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
+                lse = lse.masked_fill(empty.view(-1, 1), float("-inf"))
+                if self._dcp_sp_step():
+                    start, end = self.dcp_sp_heads
+                    output[:, start:end].copy_(
+                        dcp_merge_decode(out, lse, self.attn_sink, scatter_heads=True)
+                    )
+                else:
+                    output[:, :heads].copy_(
+                        dcp_merge_decode(out, lse, self.attn_sink)
+                    )
 
     def _forward_prefill(
         self,

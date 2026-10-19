@@ -200,16 +200,23 @@ class FlashInferPcieIpcAllReduce:
 
 
 def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
-    """Initialize the TP PCIe IPC backend immediately before graph capture."""
+    """Initialize the PCIe IPC backends immediately before graph capture: the
+    TP group's, and the DCP group's when a model gave it one."""
+    from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+
+    _warmup_group(worker, get_tp_group(), "tp")
+    _warmup_group(worker, get_dcp_group(), "dcp")
+
+
+def _warmup_group(worker: "Worker", group, name: str) -> None:
     from vllm.distributed.device_communicators.cuda_communicator import (
         CudaCommunicator,
     )
-    from vllm.distributed.parallel_state import get_tp_group
     from vllm.model_executor.warmup.flashinfer_autotune_cache import (
         resolve_flashinfer_autotune_file,
     )
 
-    tp_group = get_tp_group()
+    tp_group = group
     communicator = tp_group.device_communicator
     if not isinstance(communicator, CudaCommunicator):
         return
@@ -230,7 +237,7 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
 
     base_cache = resolve_flashinfer_autotune_file(worker.model_runner)
     ranks = "-".join(str(rank) for rank in tp_group.ranks)
-    tune_cache = base_cache.with_name(f"pcie_ipc_allreduce_tp_{ranks}.json")
+    tune_cache = base_cache.with_name(f"pcie_ipc_allreduce_{name}_{ranks}.json")
     pcie_comm.setup(
         hidden_dim=worker.model_config.get_hidden_size(),
         dtype=worker.model_config.dtype,

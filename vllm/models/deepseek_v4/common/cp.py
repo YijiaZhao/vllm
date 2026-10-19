@@ -17,15 +17,30 @@ Layout, with DCP spanning the PCP axis (``dcp == pcp``):
   window is counted on DCP rank 0 only), merged across ranks by LSE; the sink
   is applied once after the merge. Prefill attention gathers the compressed KV
   of each prefill request from all ranks and runs locally.
+* Decode-only steps shard the rest of the layer across DCP ("decode SP", TP=1
+  with EP only): the residual stream, mHC and MoE hold 1/DCP of the tokens;
+  attention all-gathers its input, computes q/kv/indexer/compressor for every
+  token (each rank needs every head's query over its KV shard), reduce-scatters
+  the merged output by head group, runs wo_a/wo_b on its own groups and
+  reduce-scatters the partial sums back to token shards. Steps with prefill
+  rows (and PIECEWISE graphs, which mixed steps replay) keep every token on
+  every rank.
+* With a MoE that takes replicated tokens (not MegaMoE), decode-only steps
+  keep every token on every rank instead, like TP: attention's per-group
+  wo_a/wo_b partial sums are all-reduced, and the MoE runs this rank's experts
+  on every token and all-reduces ("decode AR"); no token all-gathers.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -124,6 +139,197 @@ def real_token_count(cm: "CommonAttentionMetadata") -> int:
     reassigned) sliding-window blocks.
     """
     return int(cm.query_start_loc_cpu[-1])
+
+
+def dcp_decode_sp_supported(vllm_config: VllmConfig) -> bool:
+    """Whether decode-only steps shard the non-attention work across DCP."""
+    parallel_config = vllm_config.parallel_config
+    dcp = parallel_config.decode_context_parallel_size
+    hf_config = vllm_config.model_config.hf_config
+    return (
+        dcp > 1
+        and os.environ.get("VLLM_DSV4_CP_DECODE_SP", "1") == "1"
+        and parallel_config.tensor_parallel_size == 1
+        and parallel_config.data_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+        and hf_config.o_groups % dcp == 0
+    )
+
+
+def dcp_decode_ar_supported(vllm_config: VllmConfig) -> bool:
+    """Decode SP with replicated tokens: the MoE is not a token-sharded MegaMoE."""
+    from vllm.config.kernel import MEGA_MOE_BACKENDS
+
+    return (
+        dcp_decode_sp_supported(vllm_config)
+        and vllm_config.kernel_config.moe_backend not in MEGA_MOE_BACKENDS
+        and os.environ.get("VLLM_DSV4_CP_DECODE_AR", "1") == "1"
+    )
+
+
+def dcp_decode_ar_active() -> bool:
+    """Set by the model on decode-AR steps; read by the MoE runner."""
+    return is_forward_context_available() and getattr(
+        get_forward_context(), "dsv4_dcp_decode_ar", False
+    )
+
+
+def dcp_decode_sp_active() -> bool:
+    """Whether this step runs decode SP (see the module docstring).
+
+    Every rank decides the same: decode-only steps of a FULL graph or eager
+    run, from the step's attention metadata. PIECEWISE graphs are shared with
+    mixed steps, so they never do.
+    """
+    if not is_forward_context_available():
+        return False
+    ctx = get_forward_context()
+    active = getattr(ctx, "dsv4_dcp_decode_sp", None)
+    if active is None:
+        active = False
+        attn_metadata = ctx.attn_metadata
+        if ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE and isinstance(
+            attn_metadata, dict
+        ):
+            for metadata in attn_metadata.values():
+                num_prefills = getattr(metadata, "num_prefills", None)
+                if num_prefills is not None:
+                    active = num_prefills == 0 and metadata.num_decodes > 0
+                    break
+        ctx.dsv4_dcp_decode_sp = active
+    return active
+
+
+def _dcp_sp_pad(x: torch.Tensor, value=0) -> torch.Tensor:
+    pad = (-x.shape[0]) % get_dcp_group().world_size
+    if pad == 0:
+        return x
+    return torch.nn.functional.pad(x, (0, 0) * (x.ndim - 1) + (0, pad), value=value)
+
+
+def dcp_sp_shard(x: torch.Tensor) -> torch.Tensor:
+    """This DCP rank's token shard of a replicated ``[T, ...]`` tensor."""
+    group = get_dcp_group()
+    x = _dcp_sp_pad(x)
+    chunk = x.shape[0] // group.world_size
+    return x[group.rank_in_group * chunk : (group.rank_in_group + 1) * chunk]
+
+
+def dcp_sp_padding_mask(is_padding: torch.Tensor | None, num_tokens: int, device):
+    """The padding mask of this rank's token shard; shard padding is padding."""
+    if is_padding is None:
+        is_padding = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    return dcp_sp_shard(_dcp_sp_pad(is_padding[:num_tokens], value=True))
+
+
+# Decode SP collectives are small and latency-bound. vLLM's custom (P2P)
+# all-gather / reduce-scatter beat NCCL there, also over PCIe, where vLLM only
+# enables them for the TP group of fully connected GPUs. Byte bounds per call
+# (SM120 x8 PCIe: 3-6x faster than NCCL below them, slower well above).
+_DCP_CUSTOM_COMM = None
+_CUSTOM_AG_MAX_INPUT_BYTES = 64 * 1024
+_CUSTOM_RS_MAX_INPUT_BYTES = 512 * 1024
+_CUSTOM_AR_MAX_INPUT_BYTES = 2 * 1024 * 1024
+
+
+def init_dcp_custom_comm(device: torch.device) -> None:
+    """Create the DCP group's P2P communicator once (collective, at init)."""
+    global _DCP_CUSTOM_COMM
+    if _DCP_CUSTOM_COMM is not None:
+        return
+    _DCP_CUSTOM_COMM = False
+    if os.environ.get("VLLM_DSV4_CP_CUSTOM_COMM", "1") != "1":
+        return
+    device_communicator = get_dcp_group().device_communicator
+    existing = getattr(device_communicator, "ca_comm", None)
+    if existing is not None:
+        if not existing.disabled:
+            _DCP_CUSTOM_COMM = existing
+        return
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+    from vllm.platforms import current_platform
+
+    # CustomAllreduce refuses PCIe-only groups above two GPUs up front; its
+    # P2P test still guards hosts without peer access (cross-socket .2).
+    is_fully_connected = current_platform.is_fully_connected
+    current_platform.is_fully_connected = lambda physical_device_ids: True
+    try:
+        comm = CustomAllreduce(get_dcp_group().cpu_group, device)
+    finally:
+        current_platform.is_fully_connected = is_fully_connected
+    if not comm.disabled:
+        _DCP_CUSTOM_COMM = comm
+        # As the group's custom all-reduce it joins graph capture, which
+        # registers the buffers captured all-reduces read from.
+        device_communicator.ca_comm = comm
+    _init_dcp_pcie_ipc_all_reduce(device)
+
+
+def _init_dcp_pcie_ipc_all_reduce(device: torch.device) -> None:
+    """FlashInfer's PCIe all-reduce for the DCP group: push-based, it beats the
+    custom (pull) all-reduce 2-3x on PCIe-only GPUs (SM12x x8: 11/19/46 us
+    vs 16/43/129 us at 1/32/128 x 4096 bf16). Set up by kernel warmup, it
+    joins graph capture as the group's PCIe IPC backend."""
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    if (
+        os.environ.get("VLLM_DSV4_CP_PCIE_IPC_AR", "1") != "1"
+        or capability is None
+        or capability.major != 12
+    ):
+        return
+    from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
+        FlashInferPcieIpcAllReduce,
+    )
+
+    group = get_dcp_group()
+    device_communicator = group.device_communicator
+    if getattr(device_communicator, "fi_pcie_ipc_ar_comm", None) is not None:
+        return
+    comm = FlashInferPcieIpcAllReduce(
+        group=group.device_group, tune_group=group.cpu_group, device=device
+    )
+    if not comm.disabled:
+        device_communicator.fi_pcie_ipc_ar_comm = comm
+
+
+def dcp_small_all_gather(x: torch.Tensor) -> torch.Tensor | None:
+    """Dim-0 all-gather over the DCP P2P communicator, or None if too large."""
+    if _DCP_CUSTOM_COMM and x.nbytes <= _CUSTOM_AG_MAX_INPUT_BYTES:
+        return _DCP_CUSTOM_COMM.custom_all_gather(x.contiguous())
+    return None
+
+
+def dcp_sp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    out = dcp_small_all_gather(x)
+    if out is not None:
+        return out
+    return get_dcp_group().all_gather(x, dim=0)
+
+
+def dcp_sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+    x = _dcp_sp_pad(x)
+    if _DCP_CUSTOM_COMM and x.nbytes <= _CUSTOM_RS_MAX_INPUT_BYTES:
+        out = _DCP_CUSTOM_COMM.custom_reduce_scatter(x.contiguous())
+        if out is not None:
+            return out
+    return get_dcp_group().reduce_scatter(x, dim=0)
+
+
+def dcp_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    pcie_comm = getattr(get_dcp_group().device_communicator, "fi_pcie_ipc_ar_comm", None)
+    if pcie_comm is not None:
+        x = x.contiguous()
+        if pcie_comm.should_use(x):
+            return pcie_comm.all_reduce(x)
+    if _DCP_CUSTOM_COMM and x.nbytes <= _CUSTOM_AR_MAX_INPUT_BYTES:
+        out = _DCP_CUSTOM_COMM.custom_all_reduce(x.contiguous())
+        if out is not None:
+            return out
+    return get_dcp_group().all_reduce(x)
 
 
 def owner_mask(
@@ -331,16 +537,61 @@ def apply_attn_sink(
     return out * scale.unsqueeze(-1).to(out.dtype)
 
 
+def get_dcp_decode_merge_workspace(
+    vllm_config: VllmConfig,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Direct (symmetric-memory P2P) head-scattering merge for decode SP.
+
+    One peer-to-peer exchange of (out, lse) replaces the NCCL lse all-gather
+    plus output reduce-scatter. None where symmetric memory is unavailable.
+    """
+    from vllm.v1.attention.ops.dcp import (
+        get_dcp_workspace_max_num_tokens,
+        get_direct_dcp_a2a_workspace,
+    )
+
+    group = get_dcp_group()
+    return get_direct_dcp_a2a_workspace(
+        group,
+        device,
+        get_dcp_workspace_max_num_tokens(vllm_config),
+        num_heads // group.world_size,
+        head_dim,
+        dtype,
+        1,
+    )
+
+
 def dcp_merge_decode(
     out: torch.Tensor,
     lse: torch.Tensor,
     attn_sink: torch.Tensor,
+    scatter_heads: bool = False,
+    workspace=None,
 ) -> torch.Tensor:
     """Merge per-rank partial decode attention [T, H, D] by LSE ([T, H], base e).
 
-    Rows a rank has no entries for must carry (out=0, lse=-inf).
+    Rows a rank has no entries for must carry (out=0, lse=-inf). With
+    ``scatter_heads`` each rank gets only its 1/DCP of the heads, [T, H/DCP, D],
+    through ``workspace`` (get_dcp_decode_merge_workspace) when given.
     """
     group = get_dcp_group()
+    if scatter_heads and workspace is not None:
+        if group.rank_in_group == 0:
+            # The sink is one more softmax term with a zero value: fold it
+            # into rank 0's partial so the plain LSE merge applies it.
+            sink = attn_sink[: out.shape[1]].to(torch.float32)
+            lse = lse.float()
+            sink_lse = torch.logaddexp(lse, sink.unsqueeze(0))
+            out = out.float() * torch.exp(lse - sink_lse).unsqueeze(-1)
+            out, lse = out.to(workspace_dtype(workspace)), sink_lse
+        return workspace.lse_reduce(
+            out.contiguous(), lse.float().contiguous(), is_lse_base_on_e=True
+        )
     lses = group.all_gather(lse.contiguous(), dim=0).view(group.world_size, *lse.shape)
     lse_max = lses.max(dim=0).values
     lse_max = torch.where(torch.isfinite(lse_max), lse_max, torch.zeros_like(lse_max))
@@ -348,7 +599,17 @@ def dcp_merge_decode(
     lse_total = torch.log(total) + lse_max
     scale = torch.exp(lse - lse_total)
     scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
-    merged = group.all_reduce(out.float() * scale.unsqueeze(-1))
+    weighted = out.float() * scale.unsqueeze(-1)
+    if scatter_heads:
+        heads = out.shape[1] // group.world_size
+        start = group.rank_in_group * heads
+        merged = group.reduce_scatter(weighted.transpose(0, 1).contiguous(), dim=0)
+        return apply_attn_sink(
+            merged.transpose(0, 1),
+            lse_total[:, start : start + heads],
+            attn_sink[start:],
+        ).to(out.dtype)
+    merged = group.all_reduce(weighted)
     return apply_attn_sink(merged, lse_total, attn_sink).to(out.dtype)
 
 
@@ -392,6 +653,187 @@ def _dcp_local_topk_kernel(
     # Unused tail stays -1 (the caller pre-fills); padding tokens get length 0.
     is_valid = tl.load(is_valid_token_ptr + token)
     tl.store(lens_ptr + token, tl.where(is_valid, count, 0))
+
+
+@triton.jit
+def _dcp_sp_merge_prep_kernel(
+    out_ptr,
+    out_stride_t,
+    out_stride_h,
+    lse_ptr,
+    lse_stride_t,
+    lens_a_ptr,
+    lens_b_ptr,
+    sink_ptr,
+    out_c_ptr,
+    lse_c_ptr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    FOLD_SINK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    d = tl.arange(0, HEAD_DIM)
+    empty = (tl.load(lens_a_ptr + token) + tl.load(lens_b_ptr + token)) == 0
+    lse = tl.load(lse_ptr + token * lse_stride_t + head).to(tl.float32)
+    out = tl.load(out_ptr + token * out_stride_t + head * out_stride_h + d).to(
+        tl.float32
+    )
+    lse = tl.where(empty, float("-inf"), lse)
+    out = tl.where(empty, 0.0, out)
+    if FOLD_SINK:
+        sink = tl.load(sink_ptr + head).to(tl.float32)
+        hi = tl.maximum(lse, sink)
+        folded = hi + tl.log(tl.exp(lse - hi) + tl.exp(sink - hi))
+        out = out * tl.exp(lse - folded)
+        lse = folded
+    dst = token * NUM_HEADS + head
+    tl.store(out_c_ptr + dst * HEAD_DIM + d, out.to(out_c_ptr.dtype.element_ty))
+    tl.store(lse_c_ptr + dst, lse)
+
+
+def dcp_sp_merge_decode(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    lens_a: torch.Tensor,
+    lens_b: torch.Tensor,
+    attn_sink: torch.Tensor,
+    workspace,
+) -> torch.Tensor:
+    """Decode SP merge: this rank's heads of the LSE-merged attention.
+
+    ``out`` [T, H, D] / ``lse`` [T, H] are this rank's partials (strided views
+    are fine); rows with ``lens_a + lens_b == 0`` have no local entry and drop
+    out of the merge. One kernel masks them, folds the sink into rank 0's
+    partial (a zero-valued softmax term) and packs the inputs of the direct
+    P2P exchange (get_dcp_decode_merge_workspace).
+    """
+    num_tokens, num_heads, head_dim = out.shape
+    out_c = torch.empty(
+        (num_tokens, num_heads, head_dim),
+        dtype=workspace.received_output.dtype,
+        device=out.device,
+    )
+    lse_c = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=out.device)
+    if num_tokens > 0:
+        assert out.stride(2) == 1
+        _dcp_sp_merge_prep_kernel[(num_tokens, num_heads)](
+            out,
+            out.stride(0),
+            out.stride(1),
+            lse,
+            lse.stride(0),
+            lens_a,
+            lens_b,
+            attn_sink,
+            out_c,
+            lse_c,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            FOLD_SINK=get_dcp_group().rank_in_group == 0,
+        )
+    return workspace.lse_reduce(out_c, lse_c, is_lse_base_on_e=True)
+
+
+@triton.jit
+def _dcp_local_lse_kernel(
+    lse_ptr,
+    lse_stride_t,
+    lens_a_ptr,
+    lens_b_ptr,
+    lse_c_ptr,
+    NUM_HEADS: tl.constexpr,
+):
+    token = tl.program_id(0)
+    h = tl.arange(0, NUM_HEADS)
+    empty = (tl.load(lens_a_ptr + token) + tl.load(lens_b_ptr + token)) == 0
+    lse = tl.load(lse_ptr + token * lse_stride_t + h).to(tl.float32)
+    lse = tl.where(empty, float("-inf"), lse)
+    tl.store(lse_c_ptr + token * NUM_HEADS + h, lse)
+
+
+@triton.jit
+def _dcp_local_scale_kernel(
+    out_ptr,
+    out_stride_t,
+    out_stride_h,
+    lse_all_ptr,
+    sink_ptr,
+    out_s_ptr,
+    num_tokens,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    d = tl.arange(0, HEAD_DIM)
+    r = tl.arange(0, WORLD)
+    lses = tl.load(lse_all_ptr + (r * num_tokens + token) * NUM_HEADS + head)
+    sink = tl.load(sink_ptr + head).to(tl.float32)
+    hi = tl.maximum(tl.max(lses, axis=0), sink)
+    total = hi + tl.log(tl.sum(tl.exp(lses - hi), axis=0) + tl.exp(sink - hi))
+    own = tl.load(lse_all_ptr + (RANK * num_tokens + token) * NUM_HEADS + head)
+    weight = tl.exp(own - total)
+    out = tl.load(out_ptr + token * out_stride_t + head * out_stride_h + d).to(
+        tl.float32
+    )
+    out = tl.where(own == float("-inf"), 0.0, out * weight)
+    dst = (token * NUM_HEADS + head) * HEAD_DIM
+    tl.store(out_s_ptr + dst + d, out.to(out_s_ptr.dtype.element_ty))
+
+
+# From this many decode tokens on, decode SP skips the head exchange of the
+# merge: ranks share only their LSEs, and each runs wo_a/wo_b over all heads
+# of its own partial, scaled by its global softmax weight. wo_b's partial sums
+# then add up in the decoder layer's all-reduce / reduce-scatter. That trades
+# the exchange, growing with the batch, for full o_proj weight reads.
+_LOCAL_OPROJ_MIN_TOKENS = int(
+    os.environ.get("VLLM_DSV4_CP_DECODE_LOCAL_OPROJ_MIN_TOKENS", "48")
+)
+
+
+def dcp_sp_local_scale_decode(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    lens_a: torch.Tensor,
+    lens_b: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor | None:
+    """All heads of this rank's partial, weighted for an o_proj summed across
+    DCP ranks, or None below the token threshold (see above)."""
+    num_tokens, num_heads, head_dim = out.shape
+    if num_tokens < _LOCAL_OPROJ_MIN_TOKENS or num_tokens == 0:
+        return None
+    assert out.stride(2) == 1
+    group = get_dcp_group()
+    lse_c = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=out.device)
+    _dcp_local_lse_kernel[(num_tokens,)](
+        lse, lse.stride(0), lens_a, lens_b, lse_c, NUM_HEADS=num_heads
+    )
+    lse_all = dcp_sp_all_gather(lse_c)
+    out_s = torch.empty(
+        (num_tokens, num_heads, head_dim), dtype=out.dtype, device=out.device
+    )
+    _dcp_local_scale_kernel[(num_tokens, num_heads)](
+        out,
+        out.stride(0),
+        out.stride(1),
+        lse_all,
+        attn_sink,
+        out_s,
+        num_tokens,
+        WORLD=group.world_size,
+        RANK=group.rank_in_group,
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+    )
+    return out_s
+
+
+def workspace_dtype(workspace) -> torch.dtype:
+    return workspace.received_output.dtype
 
 
 def dcp_local_topk_indices_and_lens(

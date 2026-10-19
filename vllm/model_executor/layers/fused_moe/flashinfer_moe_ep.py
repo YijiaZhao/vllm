@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import _import_deep_gemm
 
 if TYPE_CHECKING:
@@ -388,7 +389,9 @@ class FlashInferMoeEp:
             )
         backend = api.MegaConfig(
             megakernel=megakernel,
-            quantize_input=True,
+            # Cake gets its MXFP8 activations from _cake_stage_inputs (one
+            # kernel instead of FlashInfer's torch-op quantization).
+            quantize_input=spec.kernel != "cake",
             preprocess_weights=True,
         )
 
@@ -456,15 +459,15 @@ class FlashInferMoeEp:
                 f"the workspace supports at most {self._max_num_tokens}"
             )
         if self._bucketed:
-            topk_ids = topk_ids.to(torch.int64)
-            is_padding = _padding_mask(hidden_states.shape[0])
-            if is_padding is not None:
-                # Padded rows (CUDA graph / PCP padding) carry stale activations;
-                # routing them can overflow the kernel's lossless BF16 return
-                # codec, which sets protocol_error and desyncs the peers' signal
-                # bookkeeping (a hang). -1 is the kernel's masked route.
-                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
-            tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+            # Padded rows (CUDA graph / PCP padding) carry stale activations;
+            # routing them can overflow the kernel's lossless BF16 return
+            # codec, which sets protocol_error and desyncs the peers' signal
+            # bookkeeping (a hang). -1 is the kernel's masked route.
+            codes, scales, topk_ids = _cake_stage_inputs(
+                hidden_states, topk_ids, _padding_mask(hidden_states.shape[0])
+            )
+            tensors = self._tensors(codes, topk_ids, topk_weights)
+            tensors.scales = scales
             self._mega_layer.stage_inputs(
                 tensors,
                 compile_tokens_per_rank=_ep_token_bound(hidden_states.shape[0]),
@@ -502,7 +505,13 @@ class FlashInferMoeEp:
             dtype=torch.float32,
             device=self._device,
         )
-        self._mega_layer.warmup(self._tensors(hidden_states, topk_ids, topk_weights))
+        if self._bucketed:
+            codes, scales, topk_ids = _cake_stage_inputs(hidden_states, topk_ids, None)
+            tensors = self._tensors(codes, topk_ids, topk_weights)
+            tensors.scales = scales
+        else:
+            tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+        self._mega_layer.warmup(tensors)
 
     def kernel_weights(
         self,
@@ -560,6 +569,88 @@ def _ue8m0_bytes(scale: torch.Tensor | None) -> torch.Tensor:
     if not torch.equal(exponents.to(scale.dtype), scale):
         raise ValueError("MX block scales must be powers of two (UE8M0)")
     return exponents.view(torch.uint8)
+
+
+@triton.jit
+def _cake_stage_kernel(
+    x_ptr,
+    x_stride,
+    codes_ptr,
+    scales_ptr,
+    ids_ptr,
+    ids_stride,
+    ids_out_ptr,
+    padding_ptr,
+    NUM_GROUPS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    groups = tl.program_id(1) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
+    cols = tl.arange(0, 32)
+    in_row = groups < NUM_GROUPS
+    offs = groups[:, None] * 32 + cols[None, :]
+    x = tl.load(x_ptr + row * x_stride + offs, mask=in_row[:, None], other=0.0).to(
+        tl.float32
+    )
+    # UE8M0 scale: the power of two >= amax / 448 (FlashInfer's
+    # quantize_activations_k32, which the kernel also uses in-kernel).
+    amax = tl.max(tl.abs(x), axis=1)
+    bits = tl.math.div_rn(amax, 448.0).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + (((bits & 0x7FFFFF) + 0x7FFFFF) >> 23)
+    exponent = tl.minimum(tl.maximum(exponent, 0), 254)
+    inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+    codes = (x * inverse[:, None]).to(tl.float8e4nv)
+    tl.store(codes_ptr + row * NUM_GROUPS * 32 + offs, codes, mask=in_row[:, None])
+    tl.store(
+        scales_ptr + row * NUM_GROUPS + groups, exponent.to(tl.uint8), mask=in_row
+    )
+    if tl.program_id(1) == 0:
+        k = tl.arange(0, PADDED_TOP_K)
+        ids = tl.load(ids_ptr + row * ids_stride + k, mask=k < TOP_K).to(tl.int64)
+        if HAS_PADDING:
+            ids = tl.where(tl.load(padding_ptr + row) != 0, -1, ids)
+        tl.store(ids_out_ptr + row * TOP_K + k, ids, mask=k < TOP_K)
+
+
+def _cake_stage_inputs(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    is_padding: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP8 codes + UE8M0 scales of the activations and int64 routing ids
+    (-1 on padding rows) for the Cake MegaMoE, in one kernel."""
+    rows, hidden = hidden_states.shape
+    top_k = topk_ids.shape[1]
+    codes = torch.empty(
+        (rows, hidden), dtype=torch.float8_e4m3fn, device=hidden_states.device
+    )
+    scales = torch.empty(
+        (rows, hidden // 32), dtype=torch.uint8, device=hidden_states.device
+    )
+    ids = torch.empty((rows, top_k), dtype=torch.int64, device=topk_ids.device)
+    if rows == 0:
+        return codes, scales, ids
+    assert hidden_states.stride(1) == 1 and topk_ids.stride(1) == 1
+    block_groups = 32
+    _cake_stage_kernel[(rows, triton.cdiv(hidden // 32, block_groups))](
+        hidden_states,
+        hidden_states.stride(0),
+        codes,
+        scales,
+        topk_ids,
+        topk_ids.stride(0),
+        ids,
+        is_padding if is_padding is not None else ids,
+        NUM_GROUPS=hidden // 32,
+        TOP_K=top_k,
+        PADDED_TOP_K=triton.next_power_of_2(top_k),
+        HAS_PADDING=is_padding is not None,
+        BLOCK_GROUPS=block_groups,
+    )
+    return codes, scales, ids
 
 
 def _padding_mask(num_tokens: int) -> torch.Tensor | None:

@@ -40,7 +40,11 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_dcp_group,
+    get_pcp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -48,7 +52,13 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4.common.cp import validate_dsv4_cp_config
+from vllm.models.deepseek_v4.common.cp import (
+    dcp_decode_sp_active,
+    dcp_decode_sp_supported,
+    get_dcp_decode_merge_workspace,
+    init_dcp_custom_comm,
+    validate_dsv4_cp_config,
+)
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -283,6 +293,48 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.wo_b",
         )
 
+        # Decode SP (deepseek_v4/common/cp.py): decode-only steps run wo_a/wo_b
+        # on this DCP rank's head groups, from copies of those slices the
+        # weight loader fills. wq_b stays whole: reading it is cheaper than
+        # all-gathering the query heads (the gather grows with the batch).
+        self.dcp_decode_sp = dcp_decode_sp_supported(vllm_config)
+        if self.dcp_decode_sp:
+            dcp_group = get_dcp_group()
+            self.dcp_sp_groups = self.n_groups // dcp_group.world_size
+            sp_heads = self.n_heads // dcp_group.world_size
+            self.dcp_sp_heads = (
+                dcp_group.rank_in_group * sp_heads,
+                (dcp_group.rank_in_group + 1) * sp_heads,
+            )
+            self.wo_a_dcp = ReplicatedLinear(
+                self.n_heads * self.head_dim // self.n_groups,
+                self.dcp_sp_groups * self.o_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wo_a_dcp",
+                return_bias=False,
+            )
+            self.wo_a_dcp.is_bmm = True
+            self.wo_a_dcp.bmm_batch_size = self.dcp_sp_groups
+            self.wo_b_dcp = ReplicatedLinear(
+                self.dcp_sp_groups * self.o_lora_rank,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wo_b_dcp",
+                return_bias=False,
+            )
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+            self.dcp_sp_merge_workspace = get_dcp_decode_merge_workspace(
+                vllm_config,
+                self.n_heads,
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                device,
+            )
+            init_dcp_custom_comm(device)
+            self.dcp_sp_attn_out: torch.Tensor | None = None
+
         # Initialize rotary embedding before the indexer/compressor consume it.
         self.rotary_emb = build_deepseek_v4_rope(
             config,
@@ -505,9 +557,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             attn_out,
         )
+        if self._dcp_sp_step():
+            # Partial sums the decoder layer adds up across DCP ranks: over
+            # this rank's head groups, or over every head of this rank's
+            # weighted partial (dcp_sp_local_scale_decode). Compressed layers
+            # hand over their merged or weighted heads directly.
+            o, self.dcp_sp_attn_out = self.dcp_sp_attn_out, None
+            if o is None:
+                start, end = self.dcp_sp_heads
+                o = attn_out[:, start:end].contiguous()
+            elif o.shape[1] == self.n_local_heads:
+                return self._o_proj(o, positions)
+            return self._dcp_sp_o_proj(o, positions)
         if isinstance(attn_out, torch.Tensor):
             attn_out = attn_out[:, : self.n_local_heads, :]
         return self._o_proj(attn_out, positions)
+
+    def _dcp_sp_step(self) -> bool:
+        return self.dcp_decode_sp and dcp_decode_sp_active()
+
+    def _dcp_sp_o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
+
+        return deep_gemm_fp8_o_proj(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.wo_a_dcp,
+            self.wo_b_dcp,
+            n_groups=self.dcp_sp_groups,
+            heads_per_group=self.n_heads // self.n_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            o_lora_rank=self.o_lora_rank,
+            einsum_recipe=self._einsum_recipe,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
 
     def _alloc_attn_out(
         self, num_tokens: int, hidden_states: torch.Tensor

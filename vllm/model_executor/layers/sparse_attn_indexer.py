@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -139,9 +141,150 @@ def _merge_dcp_topk_global(
         cp_interleave,
         row_starts,
     )
-    gathered = get_dcp_group().all_gather(packed, dim=1)
+    gathered = _dcp_all_gather_candidates(packed)
     stable_topk_from_gathered_candidates_cutedsl(
         gathered, topk_tokens, out=topk_indices
+    )
+
+
+# Decode batches from which the DCP top-k merge ships scores only (below, the
+# exchange is latency-bound and the (score, id) merge is cheaper).
+_DCP_TOPK_BY_THRESHOLD_MIN_TOKENS = int(
+    os.environ.get("VLLM_DSV4_CP_TOPK_BY_THRESHOLD_MIN_TOKENS", "16")
+)
+
+
+@triton.jit
+def _dcp_local_topk_scores_kernel(
+    logits,
+    logits_stride0,
+    topk_indices,
+    topk_stride0,
+    scores,
+    num_cols,
+    TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, TOPK)
+    local_idx = tl.load(topk_indices + row * topk_stride0 + cols)
+    valid = local_idx >= 0
+    col = tl.minimum(tl.maximum(local_idx, 0), tl.maximum(num_cols - 1, 0))
+    score = tl.load(
+        logits + row * logits_stride0 + col, mask=valid, other=-float("inf")
+    )
+    tl.store(scores + row * TOPK + cols, score)
+
+
+@triton.jit
+def _ordered_key(x):
+    """float32 -> uint32 with the same order."""
+    bits = x.to(tl.uint32, bitcast=True)
+    flip = tl.where((bits >> 31) != 0, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
+    return bits ^ flip
+
+
+@triton.jit
+def _dcp_topk_keep_above_kernel(
+    topk_indices,
+    topk_stride0,
+    scores,
+    gathered,
+    num_tokens,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    """Keep this rank's candidates scoring at least the K-th of all ranks'."""
+    row = tl.program_id(0)
+    ranks = tl.arange(0, DCP_WORLD_SIZE)[:, None]
+    cols = tl.arange(0, TOPK)
+    keys = _ordered_key(
+        tl.load(gathered + (ranks * num_tokens + row) * TOPK + cols[None, :])
+    ).to(tl.int64)
+    # Largest key with at least TOPK keys >= it, MSB first.
+    kth = tl.zeros((), dtype=tl.int64)
+    for bit in tl.static_range(31, -1, -1):
+        cand = kth | (1 << bit)
+        count = tl.sum(tl.sum((keys >= cand).to(tl.int32), axis=1), axis=0)
+        kth = tl.where(count >= TOPK, cand, kth)
+    ptrs = topk_indices + row * topk_stride0 + cols
+    local_idx = tl.load(ptrs)
+    own = _ordered_key(tl.load(scores + row * TOPK + cols)).to(tl.int64)
+    keep = (local_idx >= 0) & (own >= kth)
+    global_id = (
+        (local_idx // CP_INTERLEAVE) * (DCP_WORLD_SIZE * CP_INTERLEAVE)
+        + DCP_RANK * CP_INTERLEAVE
+        + local_idx % CP_INTERLEAVE
+    )
+    tl.store(ptrs, tl.where(keep, global_id, -1).to(local_idx.dtype))
+
+
+def _merge_dcp_topk_by_threshold(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> None:
+    """Decode variant of _merge_dcp_topk_global that ships scores only.
+
+    Ranks all-gather just the scores of their local top-K, so each finds the
+    global K-th score and keeps its own candidates at or above it, as global
+    ids (``-1`` elsewhere): half the bytes of (score, id) pairs. Every rank
+    keeps exactly its share of the global top-K, except that all candidates
+    tied with the K-th score are kept (the stable merge breaks such ties by
+    id). The attention backend only localizes this rank's ids.
+    """
+    num_tokens, topk = topk_indices.shape
+    assert topk == topk_tokens and topk_indices.stride(1) == 1
+    scores = torch.empty((num_tokens, topk), dtype=torch.float32, device=logits.device)
+    if num_tokens == 0:
+        return
+    assert logits.stride(1) == 1
+    _dcp_local_topk_scores_kernel[(num_tokens,)](
+        logits,
+        logits.stride(0),
+        topk_indices,
+        topk_indices.stride(0),
+        scores,
+        logits.shape[1],
+        TOPK=topk,
+    )
+    from vllm.models.deepseek_v4.common.cp import dcp_sp_all_gather
+
+    gathered = dcp_sp_all_gather(scores)
+    _dcp_topk_keep_above_kernel[(num_tokens,)](
+        topk_indices,
+        topk_indices.stride(0),
+        scores,
+        gathered,
+        num_tokens,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        CP_INTERLEAVE=cp_interleave,
+        TOPK=topk,
+    )
+
+
+def _dcp_all_gather_candidates(packed: torch.Tensor) -> torch.Tensor:
+    """All-gather [T, K, 2] candidates along K across DCP ranks.
+
+    Decode-sized exchanges go through DeepSeek-V4's DCP P2P communicator when
+    it is up (latency-bound; see deepseek_v4/common/cp.py).
+    """
+    from vllm.models.deepseek_v4.common.cp import dcp_small_all_gather
+
+    group = get_dcp_group()
+    gathered = dcp_small_all_gather(packed)
+    if gathered is None:
+        return group.all_gather(packed, dim=1)
+    num_tokens = packed.shape[0]
+    return (
+        gathered.view(group.world_size, num_tokens, *packed.shape[1:])
+        .transpose(0, 1)
+        .reshape(num_tokens, -1, *packed.shape[2:])
     )
 
 
@@ -934,7 +1077,12 @@ def sparse_attn_indexer(
         )
 
         if decode_metadata.global_seq_lens is not None:
-            _merge_dcp_topk_global(
+            merge = (
+                _merge_dcp_topk_by_threshold
+                if topk_indices.shape[0] >= _DCP_TOPK_BY_THRESHOLD_MIN_TOKENS
+                else _merge_dcp_topk_global
+            )
+            merge(
                 logits,
                 topk_indices,
                 topk_tokens,
